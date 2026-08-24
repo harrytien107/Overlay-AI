@@ -5,3 +5,4 @@ build/
 dist/
 *.spec
 .vscode/
+app_drm.py

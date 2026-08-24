@@ -2,25 +2,38 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import html
+import http.server
 import json
 import logging
 import os
 import re
+import secrets
 import sys
+import tempfile
+import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import webbrowser
 from ctypes import wintypes
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 from PySide6.QtCore import (
     QAbstractNativeEventFilter,
     QByteArray,
     QBuffer,
+    QEasingCurve,
     QEvent,
     QIODevice,
     QPoint,
+    Property,
+    QPropertyAnimation,
     QRect,
+    QRectF,
     QSettings,
     QSize,
     QThread,
@@ -46,9 +59,10 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QKeySequenceEdit,
@@ -63,13 +77,62 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStyle,
     QSystemTrayIcon,
+    QTabBar,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 APP_NAME = "Overlay AI"
+APP_VERSION = "1.1"
 ORG_NAME = "LocalTools"
+CODEX_AUTH_URL = "https://auth.openai.com/oauth/authorize"
+CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback"
+CODEX_CALLBACK_HOST = "127.0.0.1"
+CODEX_CALLBACK_PORT = 1455
+CODEX_API_URL = "https://chatgpt.com/backend-api/codex/responses"
+CODEX_SCOPE = "openid email profile offline_access"
+CODEX_REFRESH_LOCK = threading.Lock()
+GEMINI_KEY_LOCK = threading.Lock()
+GEMINI_KEY_INDEX = 0
+PROVIDER_MODELS = {
+    "gemini": [
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3-flash-preview",
+        "gemma-4-31b-it",
+    ],
+    "codex": [
+        "gpt-5.6-sol",
+        "gpt-5.6-sol-review",
+        "gpt-5.6-terra",
+        "gpt-5.6-terra-review",
+        "gpt-5.6-luna",
+        "gpt-5.6-luna-review",
+        "gpt-5.5",
+        "gpt-5.5-review",
+        "gpt-5.4",
+        "gpt-5.4-review",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+    ],
+}
+WM_NCHITTEST = 0x0084
 WM_HOTKEY = 0x0312
+HTLEFT = 10
+HTRIGHT = 11
+HTTOP = 12
+HTTOPLEFT = 13
+HTTOPRIGHT = 14
+HTBOTTOM = 15
+HTBOTTOMLEFT = 16
+HTBOTTOMRIGHT = 17
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
@@ -135,14 +198,28 @@ def hotkey_text(settings: QSettings, hotkey_id: int) -> str:
     return settings.value(f"hotkeys/{hotkey_id}", HOTKEYS[hotkey_id][1], str)
 
 
-def hotkey_to_win(text: str) -> tuple[int, int]:
+def normalize_gemini_keys(keys) -> list[str]:
+    return list(dict.fromkeys(str(key).strip() for key in keys if str(key).strip()))
+
+
+def rotated_gemini_keys(keys: list[str]) -> list[str]:
+    global GEMINI_KEY_INDEX
+    if not keys:
+        return []
+    with GEMINI_KEY_LOCK:
+        start = GEMINI_KEY_INDEX % len(keys)
+        GEMINI_KEY_INDEX = (GEMINI_KEY_INDEX + 1) % len(keys)
+    return keys[start:] + keys[:start]
+
+
+def hotkey_to_win(text: str, allow_repeat: bool = False) -> tuple[int, int]:
     sequence = QKeySequence.fromString(text, QKeySequence.SequenceFormat.PortableText)
     if sequence.isEmpty() or sequence.count() != 1:
         raise ValueError(f"Phím tắt không hợp lệ: {text}")
     combination = sequence[0]
     key = int(combination.key())
     modifiers = combination.keyboardModifiers()
-    win_modifiers = MOD_NOREPEAT
+    win_modifiers = 0
     if modifiers & Qt.KeyboardModifier.ControlModifier:
         win_modifiers |= MOD_CONTROL
     if modifiers & Qt.KeyboardModifier.AltModifier:
@@ -151,8 +228,10 @@ def hotkey_to_win(text: str) -> tuple[int, int]:
         win_modifiers |= MOD_SHIFT
     if modifiers & Qt.KeyboardModifier.MetaModifier:
         win_modifiers |= MOD_WIN
-    if win_modifiers == MOD_NOREPEAT:
+    if not win_modifiers:
         raise ValueError(f"Phím tắt cần ít nhất một modifier: {text}")
+    if not allow_repeat:
+        win_modifiers |= MOD_NOREPEAT
     if ord("A") <= key <= ord("Z") or ord("0") <= key <= ord("9"):
         return win_modifiers, key
     if int(Qt.Key.Key_F1) <= key <= int(Qt.Key.Key_F24):
@@ -215,6 +294,21 @@ def unprotect_secret(value: str) -> str:
         ctypes.windll.kernel32.LocalFree(output.pbData)
 
 
+def load_gemini_keys(settings: QSettings) -> list[str]:
+    encrypted = settings.value("gemini/keys", "", str)
+    if not encrypted:
+        return []
+    payload = json.loads(unprotect_secret(encrypted))
+    if not isinstance(payload, list):
+        raise ValueError("Danh sách Gemini API key đã lưu không hợp lệ.")
+    return normalize_gemini_keys(payload)
+
+
+def save_gemini_keys(settings: QSettings, keys) -> None:
+    normalized = normalize_gemini_keys(keys)
+    settings.setValue("gemini/keys", protect_secret(json.dumps(normalized)))
+
+
 def configure_logging() -> logging.Logger:
     os.makedirs(LOG_DIR, exist_ok=True)
     logger = logging.getLogger("overlay_ai")
@@ -229,8 +323,14 @@ def configure_logging() -> logging.Logger:
 def safe_response_log(raw: str) -> str:
     value = re.sub(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", "<redacted-image-data-url>", raw)
     value = re.sub(
-        r'(?i)("(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)"\s*:\s*")[^"]*(")',
+        r'(?i)("(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|code|account[_-]?id|chatgpt[_-]?account[_-]?id)"\s*:\s*")[^"]*(")',
         r"\1<redacted>\2",
+        value,
+    )
+    value = re.sub(r"(?i)Bearer\s+[^\s,;]+", "Bearer <redacted>", value)
+    value = re.sub(
+        r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\b",
+        "<redacted-jwt>",
         value,
     )
     value = re.sub(r"[A-Za-z0-9+/]{512,}={0,2}", "<redacted-long-base64>", value)
@@ -238,6 +338,375 @@ def safe_response_log(raw: str) -> str:
 
 
 LOGGER = configure_logging()
+
+
+def unique_image_path(folder: str, timestamp: str | None = None) -> str:
+    if not os.path.isdir(folder):
+        raise ValueError("Folder lưu ảnh không tồn tại.")
+    stamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    base = os.path.join(folder, f"OverlayAI_{stamp}")
+    candidate = base + ".png"
+    suffix = 1
+    while os.path.exists(candidate):
+        candidate = f"{base}_{suffix}.png"
+        suffix += 1
+    return candidate
+
+
+def save_chat_image(folder: str, image: bytes, timestamp: str | None = None) -> str:
+    for _attempt in range(10_000):
+        path = unique_image_path(folder, timestamp)
+        try:
+            with open(path, "xb") as output:
+                output.write(image)
+            return path
+        except FileExistsError:
+            continue
+    raise OSError("Không thể tạo tên file ảnh duy nhất.")
+
+
+def resize_hit_test(x: int, y: int, rect: tuple[int, int, int, int], border: int) -> int:
+    left, top, right, bottom = rect
+    near_left = left <= x < left + border
+    near_right = right - border <= x < right
+    near_top = top <= y < top + border
+    near_bottom = bottom - border <= y < bottom
+    if near_top and near_left:
+        return HTTOPLEFT
+    if near_top and near_right:
+        return HTTOPRIGHT
+    if near_bottom and near_left:
+        return HTBOTTOMLEFT
+    if near_bottom and near_right:
+        return HTBOTTOMRIGHT
+    if near_left:
+        return HTLEFT
+    if near_right:
+        return HTRIGHT
+    if near_top:
+        return HTTOP
+    if near_bottom:
+        return HTBOTTOM
+    return 0
+
+
+def migrate_provider_settings(settings: QSettings) -> None:
+    if not settings.value("provider/migrated", False, bool):
+        mappings = {
+            "api/base_url": "openai/base_url",
+            "api/model": "openai/model",
+            "api/models": "openai/models",
+            "api/key": "openai/key",
+        }
+        for old_key, new_key in mappings.items():
+            if settings.contains(old_key) and not settings.contains(new_key):
+                settings.setValue(new_key, settings.value(old_key))
+        settings.setValue("provider/current", "openai")
+        settings.setValue("provider/migrated", True)
+
+    if not settings.value("provider/editable_model_lists", False, bool):
+        retired = {
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        }
+        for provider, presets in PROVIDER_MODELS.items():
+            stored = settings.value(f"{provider}/models", [])
+            if isinstance(stored, str):
+                stored = [stored]
+            current = settings.value(f"{provider}/model", "", str).strip()
+            models = list(
+                dict.fromkeys(
+                    model
+                    for model in presets
+                    + [str(item).strip() for item in stored]
+                    + ([current] if current else [])
+                    if model and model not in retired
+                )
+            )
+            settings.setValue(f"{provider}/models", models[:20])
+            if current in retired:
+                settings.setValue(f"{provider}/model", presets[0] if presets else "")
+        settings.setValue("provider/editable_model_lists", True)
+
+    if not settings.value("provider/gemini_3_5_flash_added", False, bool):
+        models = settings.value("gemini/models", [])
+        if isinstance(models, str):
+            models = [models]
+        models = [str(item).strip() for item in models if str(item).strip()]
+        if "gemini-3.5-flash" not in models:
+            models.insert(0, "gemini-3.5-flash")
+        settings.setValue("gemini/models", models[:20])
+        settings.setValue("provider/gemini_3_5_flash_added", True)
+
+    if not settings.contains("gemini/keys") and settings.contains("gemini/key"):
+        try:
+            legacy_key = unprotect_secret(settings.value("gemini/key", "", str)).strip()
+            save_gemini_keys(settings, [legacy_key] if legacy_key else [])
+            settings.remove("gemini/key")
+        except Exception as error:
+            LOGGER.warning("Gemini legacy key migration failed type=%s", type(error).__name__)
+    settings.sync()
+
+
+def base64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def pkce_challenge(verifier: str) -> str:
+    return base64url(hashlib.sha256(verifier.encode("ascii")).digest())
+
+
+def create_pkce() -> tuple[str, str]:
+    verifier = base64url(secrets.token_bytes(64))
+    return verifier, pkce_challenge(verifier)
+
+
+def codex_authorization_url(state: str, challenge: str) -> str:
+    return CODEX_AUTH_URL + "?" + urllib.parse.urlencode(
+        {
+            "client_id": CODEX_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": CODEX_REDIRECT_URI,
+            "scope": CODEX_SCOPE,
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "prompt": "login",
+            "id_token_add_organizations": "true",
+            "codex_cli_simplified_flow": "true",
+        }
+    )
+
+
+def oauth_callback_code(target: str, expected_state: str) -> str:
+    parsed = urllib.parse.urlparse(target)
+    query = urllib.parse.parse_qs(parsed.query)
+    if parsed.path != "/auth/callback":
+        raise ValueError("Callback path không hợp lệ.")
+    if not secrets.compare_digest(query.get("state", [""])[0], expected_state):
+        raise ValueError("OAuth state không khớp; yêu cầu đã bị từ chối.")
+    if query.get("error"):
+        raise ValueError(query.get("error_description", query["error"])[0])
+    code = query.get("code", [""])[0]
+    if not code:
+        raise ValueError("Callback không có authorization code.")
+    return code
+
+
+def jwt_payload(token: str) -> dict:
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(part).decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (IndexError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def token_identity(*tokens: str) -> tuple[str, str]:
+    account_id = ""
+    email = ""
+    for token in tokens:
+        claims = jwt_payload(token)
+        email = email or str(claims.get("email", ""))
+        candidates = [claims]
+        candidates.extend(value for value in claims.values() if isinstance(value, dict))
+        for candidate in candidates:
+            account_id = account_id or str(
+                candidate.get("chatgpt_account_id") or candidate.get("account_id") or ""
+            )
+    return account_id, email
+
+
+def oauth_token_request(fields: dict[str, str]) -> dict:
+    request = urllib.request.Request(
+        CODEX_TOKEN_URL,
+        data=urllib.parse.urlencode(fields).encode("ascii"),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": f"OverlayAI/{APP_VERSION} (Windows; experimental Codex OAuth)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        error.read()
+        raise RuntimeError(f"OAuth HTTP {error.code}. Hãy thử đăng nhập lại.") from error
+    if not isinstance(payload, dict) or not payload.get("access_token"):
+        raise RuntimeError("OAuth không trả về access token hợp lệ.")
+    return payload
+
+
+def make_token_bundle(payload: dict, previous: dict | None = None) -> dict:
+    previous = previous or {}
+    access_token = str(payload.get("access_token", ""))
+    refresh_token = str(payload.get("refresh_token") or previous.get("refresh_token") or "")
+    id_token = str(payload.get("id_token") or previous.get("id_token") or "")
+    account_id, email = token_identity(access_token, id_token)
+    expires_in = max(0, int(payload.get("expires_in", 3600)))
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+        "account_id": account_id or str(previous.get("account_id", "")),
+        "email": email or str(previous.get("email", "")),
+        "expires_at": int(time.time()) + expires_in,
+        "updated_at": int(time.time()),
+    }
+
+
+def load_codex_bundle(settings: QSettings) -> dict:
+    encrypted = settings.value("codex/token_bundle", "", str)
+    if not encrypted:
+        return {}
+    payload = json.loads(unprotect_secret(encrypted))
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_codex_bundle(settings: QSettings, bundle: dict) -> None:
+    encrypted = protect_secret(json.dumps(bundle, separators=(",", ":")))
+    settings.setValue("codex/token_bundle", encrypted)
+    settings.sync()
+
+
+def refresh_codex_bundle(bundle: dict, force: bool = False) -> dict:
+    with CODEX_REFRESH_LOCK:
+        try:
+            current = load_codex_bundle(QSettings())
+        except Exception:
+            current = {}
+        if (
+            current.get("access_token")
+            and int(current.get("updated_at", 0)) > int(bundle.get("updated_at", 0))
+            and (not force or current.get("access_token") != bundle.get("access_token"))
+        ):
+            return current
+        refresh_token = str(bundle.get("refresh_token", ""))
+        if not refresh_token:
+            raise RuntimeError("Phiên Codex đã hết hạn và không có refresh token. Hãy đăng nhập lại.")
+        payload = oauth_token_request(
+            {
+                "grant_type": "refresh_token",
+                "client_id": CODEX_CLIENT_ID,
+                "refresh_token": refresh_token,
+                "scope": "openid profile email",
+            }
+        )
+        refreshed = make_token_bundle(payload, bundle)
+        save_codex_bundle(QSettings(), refreshed)
+        return refreshed
+
+
+def canonical_parts(content) -> tuple[str, str]:
+    if isinstance(content, str):
+        return content, ""
+    texts = []
+    image_url = ""
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in ("text", "input_text", "output_text"):
+                texts.append(str(part.get("text", "")))
+            elif part.get("type") in ("image_url", "input_image"):
+                value = part.get("image_url", "")
+                image_url = str(value.get("url", "") if isinstance(value, dict) else value)
+    return "\n".join(value for value in texts if value), image_url
+
+
+def codex_payload(model: str, messages: list[dict]) -> dict:
+    instructions = "\n\n".join(
+        canonical_parts(message.get("content"))[0]
+        for message in messages
+        if message.get("role") == "system"
+    ).strip()
+    items = []
+    for message in messages:
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text, image_url = canonical_parts(message.get("content"))
+        content = []
+        if text:
+            content.append({"type": "output_text" if role == "assistant" else "input_text", "text": text})
+        if image_url and role == "user":
+            content.append({"type": "input_image", "image_url": image_url})
+        if content:
+            items.append({"role": role, "content": content})
+    return {"model": model, "instructions": instructions, "input": items, "stream": True, "store": False}
+
+
+def gemini_payload(messages: list[dict]) -> dict:
+    system = "\n\n".join(
+        canonical_parts(message.get("content"))[0]
+        for message in messages
+        if message.get("role") == "system"
+    ).strip()
+    contents = []
+    for message in messages:
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text, image_url = canonical_parts(message.get("content"))
+        parts = []
+        if text:
+            parts.append({"text": text})
+        if image_url.startswith("data:") and "," in image_url:
+            metadata, data = image_url.split(",", 1)
+            mime_type = metadata[5:].split(";", 1)[0]
+            parts.append({"inlineData": {"mimeType": mime_type, "data": data}})
+        if parts:
+            contents.append({"role": "model" if role == "assistant" else "user", "parts": parts})
+    payload = {"contents": contents}
+    if system:
+        payload["systemInstruction"] = {"parts": [{"text": system}]}
+    return payload
+
+
+def gemini_text(payload: dict) -> str:
+    candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
+    if not candidates or not isinstance(candidates[0], dict):
+        return ""
+    content = candidates[0].get("content", {})
+    parts = content.get("parts", []) if isinstance(content, dict) else []
+    return "\n".join(
+        str(part.get("text", "")) for part in parts if isinstance(part, dict) and part.get("text")
+    ).strip()
+
+
+def codex_sse_text(raw: str) -> tuple[str, bool]:
+    deltas = []
+    final_payload = None
+    for line in raw.splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type", "") if isinstance(event, dict) else ""
+        if event_type == "response.output_text.delta":
+            delta = event.get("delta", "")
+            if isinstance(delta, str):
+                deltas.append(delta)
+        elif event_type == "response.completed":
+            final_payload = event.get("response")
+    if deltas:
+        return "".join(deltas).strip(), True
+    if isinstance(final_payload, dict):
+        return assistant_text(final_payload).strip(), False
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return "", False
+    return assistant_text(payload).strip(), False
 
 
 def chat_endpoint(base_url: str) -> str:
@@ -349,87 +818,250 @@ class HotkeyFilter(QAbstractNativeEventFilter):
         return False, 0
 
 
+class CodexOAuthWorker(QThread):
+    succeeded = Signal(dict)
+    failed = Signal(str)
+
+    def run(self) -> None:
+        state = base64url(secrets.token_bytes(32))
+        verifier, challenge = create_pkce()
+        result: dict[str, str] = {}
+
+        class CallbackHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - stdlib API
+                try:
+                    result["code"] = oauth_callback_code(self.path, state)
+                    status = 200
+                except ValueError as error:
+                    result["error"] = str(error)
+                    status = 400
+                message = (
+                    "Đăng nhập thành công. Bạn có thể đóng tab này."
+                    if status == 200
+                    else "Đăng nhập thất bại. Hãy quay lại Overlay AI."
+                )
+                body = f"<!doctype html><meta charset='utf-8'><title>Overlay AI</title><p>{html.escape(message)}</p>".encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args) -> None:
+                return
+
+        try:
+            server = http.server.HTTPServer((CODEX_CALLBACK_HOST, CODEX_CALLBACK_PORT), CallbackHandler)
+            server.timeout = 180
+            try:
+                if not webbrowser.open(codex_authorization_url(state, challenge)):
+                    raise RuntimeError("Không mở được trình duyệt hệ thống.")
+                server.handle_request()
+            finally:
+                server.server_close()
+            if not result:
+                raise TimeoutError("Đăng nhập Codex quá thời gian 3 phút.")
+            if result.get("error"):
+                raise RuntimeError(result["error"])
+            payload = oauth_token_request(
+                {
+                    "grant_type": "authorization_code",
+                    "client_id": CODEX_CLIENT_ID,
+                    "code": result["code"],
+                    "redirect_uri": CODEX_REDIRECT_URI,
+                    "code_verifier": verifier,
+                }
+            )
+            bundle = make_token_bundle(payload)
+            if not bundle["account_id"]:
+                raise RuntimeError("Token không chứa ChatGPT account ID cần cho Codex backend.")
+            save_codex_bundle(QSettings(), bundle)
+            self.succeeded.emit(bundle)
+        except Exception as error:
+            LOGGER.error("Codex OAuth failed: %s", type(error).__name__)
+            self.failed.emit(str(error))
+
+
 class ChatWorker(QThread):
     succeeded = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, endpoint: str, api_key: str, model: str, messages: list[dict]):
+    def __init__(self, provider: str, model: str, messages: list[dict], config: dict):
         super().__init__()
-        self.endpoint = endpoint
-        self.api_key = api_key
+        self.provider = provider
         self.model = model
         self.messages = messages
+        self.config = config
+        self._response = None
+        self._response_lock = threading.Lock()
+
+    def cancel(self) -> None:
+        self.requestInterruption()
+        with self._response_lock:
+            response = self._response
+        if response is not None:
+            response.close()
+
+    def _request(self, endpoint: str, payload: dict, headers: dict) -> tuple[str, str]:
+        if self.isInterruptionRequested():
+            raise InterruptedError("Request đã bị hủy.")
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+        response = urllib.request.urlopen(request, timeout=120)
+        with self._response_lock:
+            self._response = response
+        try:
+            chunks = []
+            while True:
+                if self.isInterruptionRequested():
+                    raise InterruptedError("Request đã bị hủy.")
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+            charset = response.headers.get_content_charset() or "utf-8"
+            return raw.decode(charset, errors="replace"), response.headers.get("Content-Type", "")
+        finally:
+            response.close()
+            with self._response_lock:
+                if self._response is response:
+                    self._response = None
+
+    def _gemini_request(self) -> tuple[str, dict]:
+        keys = rotated_gemini_keys(self.config["api_keys"])
+        if not keys:
+            raise ValueError("Chưa cấu hình Gemini API key.")
+        last_error = None
+        for index, api_key in enumerate(keys):
+            endpoint = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                + urllib.parse.quote(self.model, safe="")
+                + ":generateContent?key="
+                + urllib.parse.quote(api_key, safe="")
+            )
+            try:
+                raw, _content_type = self._request(
+                    endpoint,
+                    gemini_payload(self.messages),
+                    {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "User-Agent": f"OverlayAI/{APP_VERSION} (Windows; Gemini API client)",
+                    },
+                )
+                payload = json.loads(raw)
+                return gemini_text(payload), payload
+            except urllib.error.HTTPError as error:
+                last_error = error
+                if error.code not in (401, 403, 429) or index == len(keys) - 1:
+                    raise
+                LOGGER.warning(
+                    "Gemini key rejected; trying next key status=%d key_index=%d",
+                    error.code,
+                    index,
+                )
+                error.close()
+        raise last_error or RuntimeError("Không có Gemini API key khả dụng.")
+
+    def _codex_request(self) -> str:
+        bundle = dict(self.config["token_bundle"])
+        if int(bundle.get("expires_at", 0)) <= int(time.time()) + 60:
+            bundle = refresh_codex_bundle(bundle)
+        for attempt in range(2):
+            headers = {
+                "Authorization": f"Bearer {bundle['access_token']}",
+                "ChatGPT-Account-ID": bundle["account_id"],
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "OpenAI-Beta": "responses=experimental",
+                "originator": "OverlayAI",
+                "User-Agent": f"OverlayAI/{APP_VERSION} (Windows)",
+            }
+            try:
+                raw, _content_type = self._request(
+                    CODEX_API_URL, codex_payload(self.model, self.messages), headers
+                )
+                text, _partial = codex_sse_text(raw)
+                return text
+            except urllib.error.HTTPError as error:
+                if error.code == 401 and attempt == 0:
+                    bundle = refresh_codex_bundle(bundle, force=True)
+                    continue
+                raise
+        return ""
 
     def run(self) -> None:
         request_id = f"{id(self):x}"
-        body = json.dumps(
-            {"model": self.model, "messages": self.messages, "stream": False},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "OverlayAI/1.0 (Windows; OpenAI-compatible API client)",
-        }
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        request = urllib.request.Request(self.endpoint, data=body, headers=headers, method="POST")
         LOGGER.info(
-            "chat request id=%s endpoint=%s model=%s messages=%d request_bytes=%d",
+            "chat request id=%s provider=%s model=%s messages=%d",
             request_id,
-            self.endpoint,
+            self.provider,
             self.model,
             len(self.messages),
-            len(body),
         )
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                raw = response.read()
-                charset = response.headers.get_content_charset() or "utf-8"
-                decoded = raw.decode(charset, errors="replace")
-                LOGGER.info(
-                    "chat response id=%s status=%s content_type=%s response_bytes=%d body=%s",
-                    request_id,
-                    response.status,
-                    response.headers.get("Content-Type", ""),
-                    len(raw),
-                    safe_response_log(decoded),
+            if self.provider == "openai":
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": f"OverlayAI/{APP_VERSION} (Windows; OpenAI-compatible API client)",
+                }
+                if self.config.get("api_key"):
+                    headers["Authorization"] = f"Bearer {self.config['api_key']}"
+                raw, _content_type = self._request(
+                    self.config["endpoint"],
+                    {"model": self.model, "messages": self.messages, "stream": False},
+                    headers,
                 )
-                payload = json.loads(decoded)
-            text = assistant_text(payload).strip()
+                payload = json.loads(raw)
+                text = assistant_text(payload).strip()
+            elif self.provider == "gemini":
+                text, payload = self._gemini_request()
+            elif self.provider == "codex":
+                text = self._codex_request()
+                payload = {}
+            else:
+                raise ValueError(f"Provider không hợp lệ: {self.provider}")
+            if self.isInterruptionRequested():
+                return
             if not text:
                 schema = response_schema(payload)
-                LOGGER.error(
-                    "chat empty content id=%s model=%s schema=%s log=%s",
-                    request_id,
-                    self.model,
-                    schema,
-                    LOG_PATH,
-                )
-                self.failed.emit(
+                raise RuntimeError(
                     f"Provider trả về HTTP 200 nhưng không có nội dung. Model: {self.model}. "
-                    f"Request ID: {request_id}. Schema nhận được: {schema}. "
-                    f"Chi tiết đã ghi tại: {LOG_PATH}"
+                    f"Request ID: {request_id}. Schema: {schema}. Log: {LOG_PATH}"
                 )
-                return
             self.succeeded.emit(text)
         except urllib.error.HTTPError as error:
+            if self.isInterruptionRequested():
+                return
             details = error.read().decode("utf-8", errors="replace")[:1200]
             LOGGER.error(
-                "chat HTTP error id=%s status=%d body=%s",
+                "chat HTTP error id=%s provider=%s status=%d body=%s",
                 request_id,
+                self.provider,
                 error.code,
                 safe_response_log(details),
             )
-            if error.code == 403 and ("error 1010" in details.lower() or "browser_signature_banned" in details):
+            if self.provider == "codex" and error.code == 403:
                 self.failed.emit(
-                    "Cloudflare Error 1010: tunnel đang chặn chữ ký HTTP client trước khi request tới API. "
-                    "Chủ tunnel cần tạo allow/skip rule cho API route hoặc User-Agent OverlayAI/1.0; "
-                    "đổi API key hay thử lại sẽ không sửa được lỗi này."
+                    "Codex HTTP 403: backend nội bộ từ chối tài khoản, model hoặc danh tính Overlay AI; "
+                    "ứng dụng không giả danh phiên bản Codex CLI. " + safe_response_log(details)
                 )
+            elif error.code == 429:
+                self.failed.emit("HTTP 429: provider đang giới hạn tần suất. Hãy chờ rồi gửi lại.")
+            elif error.code == 401 and self.provider == "codex":
+                self.failed.emit("Phiên Codex không còn hợp lệ. Hãy đăng nhập lại trong Cài đặt.")
+            elif error.code == 403 and (
+                "error 1010" in details.lower() or "browser_signature_banned" in details
+            ):
+                self.failed.emit("Cloudflare Error 1010: dịch vụ đang chặn chữ ký HTTP của Overlay AI.")
             else:
-                self.failed.emit(f"HTTP {error.code}: {details}")
+                self.failed.emit(f"HTTP {error.code}: {safe_response_log(details)}")
         except Exception as error:
+            if self.isInterruptionRequested():
+                LOGGER.info("chat request canceled id=%s provider=%s", request_id, self.provider)
+                return
             LOGGER.exception("chat exception id=%s type=%s", request_id, type(error).__name__)
             self.failed.emit(str(error))
 
@@ -455,40 +1087,131 @@ class NoWheelSlider(QSlider):
         event.ignore()
 
 
+class AnimatedToggle(QCheckBox):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._knob_position = 0.0
+        self.setFixedSize(56, 26)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAccessibleName("Bật hoặc tắt lưu ảnh đã gửi")
+        self.animation = QPropertyAnimation(self, b"knobPosition", self)
+        self.animation.setDuration(180)
+        self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.toggled.connect(self.animate_toggle)
+
+    def hitButton(self, position: QPoint) -> bool:  # noqa: N802 - Qt API
+        return self.rect().contains(position)
+
+    def knob_position(self) -> float:
+        return self._knob_position
+
+    def set_knob_position(self, position: float) -> None:
+        self._knob_position = position
+        self.update()
+
+    knobPosition = Property(float, knob_position, set_knob_position)
+
+    def animate_toggle(self, checked: bool) -> None:
+        self.animation.stop()
+        self.animation.setStartValue(self._knob_position)
+        self.animation.setEndValue(1.0 if checked else 0.0)
+        self.animation.start()
+        self.setAccessibleDescription("Bật" if checked else "Tắt")
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        track = QRectF(0, 1, self.width(), self.height() - 2)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#249b62" if self.isChecked() else "#555b66"))
+        painter.drawRoundedRect(track, 12, 12)
+        painter.setPen(QColor("white"))
+        text_rect = QRectF(3, 1, 31, 24) if self.isChecked() else QRectF(22, 1, 31, 24)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, "Bật" if self.isChecked() else "Tắt")
+        knob_size = 18
+        knob_x = 4 + self._knob_position * (self.width() - knob_size - 8)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("white"))
+        painter.drawEllipse(QRectF(knob_x, 4, knob_size, knob_size))
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: QSettings, parent: QWidget | None = None):
         super().__init__(parent)
         self.settings = settings
         self.overlay = parent
+        migrate_provider_settings(settings)
+        self.loading_provider = True
+        self.oauth_worker: CodexOAuthWorker | None = None
+        self.test_worker: ChatWorker | None = None
+        self.current_provider = settings.value("provider/current", "openai", str)
         self.setObjectName("settingsPanel")
         self.setWindowTitle("Cài đặt Overlay AI")
         self.setMinimumWidth(0)
         if parent is not None:
             self.setWindowOpacity(parent.windowOpacity())
 
-        self.base_url = QLineEdit(settings.value("api/base_url", "https://api.openai.com/v1", str))
+        self.provider = NoWheelComboBox()
+        self.provider.addItem("OpenAI-compatible", "openai")
+        self.provider.addItem("Gemini API", "gemini")
+        self.provider.addItem("Codex OAuth", "codex")
+        provider_index = self.provider.findData(self.current_provider)
+        self.provider.setCurrentIndex(max(0, provider_index))
+        self.current_provider = self.provider.currentData()
+        self.base_url = QLineEdit()
         self.model = NoWheelComboBox()
         self.model.setEditable(True)
-        current_model = settings.value("api/model", "gpt-4o-mini", str).strip()
-        model_history = settings.value("api/models", [])
-        if isinstance(model_history, str):
-            model_history = [model_history]
-        models = list(dict.fromkeys(str(item).strip() for item in model_history))
-        self.model.addItems([item for item in models if item])
-        self.model.setCurrentText(current_model)
         self.model_row = QWidget()
         self.model_layout = QHBoxLayout(self.model_row)
         self.model_layout.setContentsMargins(0, 0, 0, 0)
         self.model_layout.setSpacing(6)
         self.model_action = QPushButton()
         self.model_action.clicked.connect(self.toggle_model_saved)
+        self.model_test = QPushButton("Test")
+        self.model_test.setToolTip("Gửi một prompt tối thiểu để kiểm tra model đang chọn")
+        self.model_test.clicked.connect(self.test_current_model)
         self.model_layout.addWidget(self.model, 1)
         self.model_layout.addWidget(self.model_action)
+        self.model_layout.addWidget(self.model_test)
         self.model.currentIndexChanged.connect(self.select_saved_model)
         self.model.editTextChanged.connect(self.update_model_action)
         self.update_model_action()
+        self.model_test_status = QLabel("Chưa test model")
+        self.model_test_status.setWordWrap(True)
+        self.model_test_effect = QGraphicsOpacityEffect(self.model_test_status)
+        self.model_test_effect.setOpacity(1.0)
+        self.model_test_status.setGraphicsEffect(self.model_test_effect)
+        self.model_test_animation = QPropertyAnimation(
+            self.model_test_effect, b"opacity", self
+        )
+        self.model_test_animation.setDuration(450)
+        self.model_test_animation.setStartValue(0.0)
+        self.model_test_animation.setEndValue(1.0)
+        self.model_test_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.model.editTextChanged.connect(self.model_changed)
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gemini_key_tabs = QTabWidget()
+        self.gemini_key_tabs.setDocumentMode(True)
+        self.gemini_key_tabs.setTabsClosable(True)
+        self.gemini_key_tabs.setMinimumHeight(72)
+        self.gemini_key_tabs.tabBar().setExpanding(False)
+        self.gemini_key_tabs.tabCloseRequested.connect(self.remove_gemini_key_tab)
+        self.gemini_key_tabs.tabBarClicked.connect(self.gemini_tab_clicked)
+        add_page = QWidget()
+        add_index = self.gemini_key_tabs.addTab(add_page, "+")
+        self.gemini_key_tabs.setTabToolTip(add_index, "Thêm Gemini API key")
+        self.gemini_key_tabs.tabBar().setTabButton(
+            add_index, QTabBar.ButtonPosition.RightSide, None
+        )
+        self.gemini_key_tabs.tabBar().setTabButton(
+            add_index, QTabBar.ButtonPosition.LeftSide, None
+        )
+        self.add_gemini_key_tab()
+        self.codex_status = QLabel()
+        self.codex_status.setWordWrap(True)
+        self.codex_action = QPushButton("Đăng nhập")
+        self.codex_action.clicked.connect(self.toggle_codex_session)
         self.image_prompt = QPlainTextEdit(
             settings.value(
                 "capture/image_prompt",
@@ -498,11 +1221,36 @@ class SettingsDialog(QDialog):
         )
         self.image_prompt.setMaximumHeight(72)
         self.image_prompt.setPlaceholderText("Prompt hệ thống thêm vào khi gửi kèm ảnh")
-        try:
-            self.api_key.setText(unprotect_secret(settings.value("api/key", "", str)))
-        except Exception:
-            self.api_key.setPlaceholderText("Không đọc được key đã lưu; nhập lại")
-
+        self.image_folder = QLineEdit(settings.value("capture/save_folder", "", str))
+        self.image_folder.setReadOnly(True)
+        self.image_folder.setPlaceholderText("Chưa chọn folder lưu ảnh")
+        self.choose_image_folder_button = QPushButton()
+        self.choose_image_folder_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon)
+        )
+        self.choose_image_folder_button.setFixedSize(34, 34)
+        self.choose_image_folder_button.setToolTip("Chọn folder lưu ảnh")
+        self.choose_image_folder_button.setAccessibleName("Chọn folder lưu ảnh")
+        self.open_image_folder_button = QPushButton("Mở")
+        self.image_save_toggle = AnimatedToggle()
+        self.image_save_toggle.setChecked(
+            settings.value(
+                "capture/save_enabled", bool(self.image_folder.text().strip()), bool
+            )
+        )
+        self.image_save_toggle.set_knob_position(1.0 if self.image_save_toggle.isChecked() else 0.0)
+        self.choose_image_folder_button.clicked.connect(self.choose_image_folder)
+        self.open_image_folder_button.clicked.connect(self.open_image_folder)
+        self.image_save_toggle.toggled.connect(self.image_save_toggled)
+        self.image_folder_row = QWidget()
+        image_folder_layout = QHBoxLayout(self.image_folder_row)
+        image_folder_layout.setContentsMargins(0, 0, 0, 0)
+        image_folder_layout.setSpacing(6)
+        image_folder_layout.addWidget(self.image_folder, 1)
+        image_folder_layout.addWidget(self.choose_image_folder_button)
+        image_folder_layout.addWidget(self.open_image_folder_button)
+        image_folder_layout.addWidget(self.image_save_toggle)
+        self.update_image_folder_buttons()
         self.always_on_top = QCheckBox("Luôn ở trên cùng")
         self.always_on_top.setChecked(settings.value("window/always_on_top", True, bool))
         self.keep_on_top = QCheckBox("Định kỳ giữ cửa sổ trên cùng")
@@ -522,7 +1270,7 @@ class SettingsDialog(QDialog):
         self.opacity.setValue(round(float(settings.value("window/opacity", 0.94)) * 100))
         self.opacity.setToolTip("Độ hiển thị 5–100%; 5% là trong suốt nhất")
         self.opacity_value = QLabel(f"{self.opacity.value()}%")
-        self.opacity.valueChanged.connect(lambda value: self.opacity_value.setText(f"{value}%"))
+        self.opacity.valueChanged.connect(self.change_opacity)
         opacity_row = QWidget()
         opacity_layout = QHBoxLayout(opacity_row)
         opacity_layout.setContentsMargins(0, 0, 0, 0)
@@ -538,10 +1286,16 @@ class SettingsDialog(QDialog):
 
         self.form = QFormLayout()
         self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.form.addRow("Provider", self.provider)
         self.form.addRow("Base URL", self.base_url)
         self.form.addRow("Model", self.model_row)
+        self.form.addRow("Trạng thái model", self.model_test_status)
         self.form.addRow("API key", self.api_key)
+        self.form.addRow("Gemini API keys", self.gemini_key_tabs)
+        self.form.addRow("Tài khoản Codex", self.codex_status)
+        self.form.addRow("", self.codex_action)
         self.form.addRow("Prompt khi gửi ảnh", self.image_prompt)
+        self.form.addRow("Folder lưu ảnh đã gửi", self.image_folder_row)
         self.form.addRow("", self.always_on_top)
         self.form.addRow("", self.keep_on_top)
         self.form.addRow("", self.hide_during_capture)
@@ -574,8 +1328,8 @@ class SettingsDialog(QDialog):
         shortcut_status.setStyleSheet("color: #79d9a6;" if not failures else "color: #ff8d9e;")
 
         note = QLabel(
-            "Tự động lưu. Base URL ví dụ: https://api.openai.com/v1. API key được mã hóa "
-            "bằng Windows DPAPI cho tài khoản Windows hiện tại."
+            "Tự động lưu. API key và phiên Codex được mã hóa bằng Windows DPAPI "
+            "cho tài khoản Windows hiện tại."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #93a4bd;")
@@ -596,6 +1350,7 @@ class SettingsDialog(QDialog):
         self.autosave_timer.timeout.connect(self.save_settings)
         for edit in (self.base_url, self.api_key):
             edit.textChanged.connect(self.schedule_auto_save)
+        self.provider.currentIndexChanged.connect(self.change_provider)
         self.model.editTextChanged.connect(self.schedule_auto_save)
         self.image_prompt.textChanged.connect(self.schedule_auto_save)
         for checkbox in (
@@ -608,11 +1363,13 @@ class SettingsDialog(QDialog):
         ):
             checkbox.toggled.connect(self.schedule_auto_save)
         self.allow_tiny_resize.toggled.connect(self.change_resize_mode)
-        self.opacity.valueChanged.connect(self.schedule_auto_save)
         self.theme.currentIndexChanged.connect(self.schedule_auto_save)
         for edit in self.hotkey_edits.values():
             edit.editingFinished.connect(self.schedule_auto_save)
 
+        self.load_provider_fields(self.current_provider)
+        self.loading_provider = False
+        self.update_provider_visibility()
         self.apply_responsive_layout()
         self.apply_appearance()
 
@@ -637,6 +1394,208 @@ class SettingsDialog(QDialog):
             else QHBoxLayout.Direction.LeftToRight
         )
 
+    def provider_default_model(self, provider: str) -> str:
+        presets = PROVIDER_MODELS.get(provider, [])
+        return presets[0] if presets else "gpt-4o-mini" if provider == "openai" else ""
+
+    def gemini_key_tab_count(self) -> int:
+        return self.gemini_key_tabs.count() - 1
+
+    def gemini_tab_clicked(self, index: int) -> None:
+        if index == self.gemini_key_tab_count():
+            self.add_gemini_key_tab(focus=True)
+
+    def add_gemini_key_tab(self, value: str = "", focus: bool = False) -> None:
+        index = self.gemini_key_tab_count()
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(4, 6, 4, 4)
+        edit = QLineEdit(value)
+        edit.setEchoMode(QLineEdit.EchoMode.Password)
+        edit.setPlaceholderText("Nhập một Gemini API key")
+        edit.setAccessibleName(f"Gemini API key {index + 1}")
+        edit.textChanged.connect(self.schedule_auto_save)
+        layout.addWidget(edit)
+        self.gemini_key_tabs.insertTab(index, page, str(index + 1))
+        self.gemini_key_tabs.setCurrentIndex(index)
+        if focus:
+            edit.setFocus()
+
+    def remove_gemini_key_tab(self, index: int) -> None:
+        key_count = self.gemini_key_tab_count()
+        if index < 0 or index >= key_count:
+            return
+        if key_count == 1:
+            edit = self.gemini_key_tabs.widget(0).findChild(QLineEdit)
+            if edit is not None:
+                edit.clear()
+            return
+        page = self.gemini_key_tabs.widget(index)
+        self.gemini_key_tabs.removeTab(index)
+        page.deleteLater()
+        for tab_index in range(self.gemini_key_tab_count()):
+            self.gemini_key_tabs.setTabText(tab_index, str(tab_index + 1))
+            edit = self.gemini_key_tabs.widget(tab_index).findChild(QLineEdit)
+            if edit is not None:
+                edit.setAccessibleName(f"Gemini API key {tab_index + 1}")
+        self.schedule_auto_save()
+
+    def gemini_keys(self) -> list[str]:
+        return normalize_gemini_keys(
+            edit.text()
+            for index in range(self.gemini_key_tab_count())
+            if (edit := self.gemini_key_tabs.widget(index).findChild(QLineEdit)) is not None
+        )
+
+    def set_gemini_keys(self, keys) -> None:
+        while self.gemini_key_tab_count():
+            page = self.gemini_key_tabs.widget(0)
+            self.gemini_key_tabs.removeTab(0)
+            page.deleteLater()
+        for key in normalize_gemini_keys(keys) or [""]:
+            self.add_gemini_key_tab(key)
+        self.gemini_key_tabs.setCurrentIndex(0)
+
+    def load_provider_fields(self, provider: str) -> None:
+        self.loading_provider = True
+        self.base_url.setText(self.settings.value("openai/base_url", "https://api.openai.com/v1", str))
+        self.model.clear()
+        model_history = self.settings.value(f"{provider}/models", [])
+        if isinstance(model_history, str):
+            model_history = [model_history]
+        current_model = self.settings.value(
+            f"{provider}/model", self.provider_default_model(provider), str
+        ).strip()
+        models = list(
+            dict.fromkeys(
+                [str(item).strip() for item in model_history if str(item).strip()]
+                + ([current_model] if current_model else [])
+            )
+        )
+        self.model.addItems(models)
+        self.model.setCurrentText(current_model)
+        self.set_model_test_status("Chưa test model")
+        self.api_key.clear()
+        self.api_key.setPlaceholderText("")
+        if provider == "openai":
+            try:
+                self.api_key.setText(unprotect_secret(self.settings.value("openai/key", "", str)))
+            except Exception:
+                self.api_key.setPlaceholderText("Không đọc được key đã lưu; nhập lại")
+        elif provider == "gemini":
+            try:
+                self.set_gemini_keys(load_gemini_keys(self.settings))
+            except Exception:
+                self.set_gemini_keys([])
+                edit = self.gemini_key_tabs.widget(0).findChild(QLineEdit)
+                if edit is not None:
+                    edit.setPlaceholderText("Không đọc được danh sách key; nhập lại")
+        self.loading_provider = False
+        self.update_model_action()
+        self.update_codex_status()
+
+    def persist_provider_fields(self, provider: str, errors: list[str]) -> None:
+        if provider == "openai":
+            try:
+                base_url = self.base_url.text().strip()
+                chat_endpoint(base_url)
+                self.settings.setValue("openai/base_url", base_url)
+            except Exception as error:
+                errors.append(str(error))
+        model = self.model.currentText().strip()
+        if model:
+            self.settings.setValue(f"{provider}/model", model)
+        else:
+            errors.append("Model không được để trống.")
+        self.settings.setValue(f"{provider}/models", list(dict.fromkeys(self.saved_models()))[:20])
+        try:
+            if provider == "openai":
+                self.settings.setValue("openai/key", protect_secret(self.api_key.text().strip()))
+            elif provider == "gemini":
+                save_gemini_keys(self.settings, self.gemini_keys())
+                self.settings.remove("gemini/key")
+        except Exception as error:
+            errors.append(str(error))
+
+    def change_provider(self, _index: int) -> None:
+        if self.loading_provider:
+            return
+        errors: list[str] = []
+        self.persist_provider_fields(self.current_provider, errors)
+        self.current_provider = self.provider.currentData()
+        self.settings.setValue("provider/current", self.current_provider)
+        self.load_provider_fields(self.current_provider)
+        self.update_provider_visibility()
+        self.settings.sync()
+
+    def update_provider_visibility(self) -> None:
+        provider = self.current_provider
+        for widget in (self.base_url, self.form.labelForField(self.base_url)):
+            if widget is not None:
+                widget.setVisible(provider == "openai")
+        for widget in (self.api_key, self.form.labelForField(self.api_key)):
+            if widget is not None:
+                widget.setVisible(provider == "openai")
+        for widget in (self.gemini_key_tabs, self.form.labelForField(self.gemini_key_tabs)):
+            if widget is not None:
+                widget.setVisible(provider == "gemini")
+        for widget in (
+            self.codex_status,
+            self.form.labelForField(self.codex_status),
+            self.codex_action,
+            self.form.labelForField(self.codex_action),
+        ):
+            if widget is not None:
+                widget.setVisible(provider == "codex")
+
+    def update_codex_status(self) -> None:
+        try:
+            bundle = load_codex_bundle(self.settings)
+        except Exception:
+            bundle = {}
+        identity = bundle.get("email") or bundle.get("account_id")
+        self.codex_logged_in = bool(identity)
+        self.codex_status.setText(f"Đã đăng nhập: {identity}" if identity else "Chưa đăng nhập")
+        self.codex_action.setText("Đăng xuất" if identity else "Đăng nhập")
+        self.codex_action.setEnabled(self.oauth_worker is None)
+
+    def toggle_codex_session(self) -> None:
+        if self.codex_logged_in:
+            self.logout_codex()
+        else:
+            self.start_codex_login()
+
+    def start_codex_login(self) -> None:
+        if self.oauth_worker is not None:
+            return
+        self.oauth_worker = CodexOAuthWorker()
+        self.oauth_worker.succeeded.connect(self.codex_login_succeeded)
+        self.oauth_worker.failed.connect(self.codex_login_failed)
+        self.oauth_worker.finished.connect(self.oauth_worker_finished)
+        self.codex_status.setText("Đang chờ đăng nhập trong trình duyệt…")
+        self.codex_action.setText("Đang đăng nhập…")
+        self.codex_action.setEnabled(False)
+        self.oauth_worker.start()
+
+    def codex_login_succeeded(self, bundle: dict) -> None:
+        identity = bundle.get("email") or bundle.get("account_id")
+        self.codex_status.setText(f"Đã đăng nhập: {identity}")
+
+    def codex_login_failed(self, message: str) -> None:
+        self.codex_status.setText("Đăng nhập thất bại")
+        QMessageBox.warning(self, "Codex OAuth", message)
+
+    def oauth_worker_finished(self) -> None:
+        if self.oauth_worker is not None:
+            self.oauth_worker.deleteLater()
+        self.oauth_worker = None
+        self.update_codex_status()
+
+    def logout_codex(self) -> None:
+        self.settings.remove("codex/token_bundle")
+        self.settings.sync()
+        self.update_codex_status()
+
     def saved_models(self) -> list[str]:
         return [
             self.model.itemText(index).strip()
@@ -648,14 +1607,17 @@ class SettingsDialog(QDialog):
         model = self.model.currentText().strip()
         saved = bool(model) and self.model.findText(model) >= 0
         self.model_action.setText("Xóa" if saved else "Lưu model")
-        self.model_action.setEnabled(bool(model))
+        self.model_action.setEnabled(bool(model) and self.test_worker is None)
+        if self.test_worker is None:
+            self.model_test.setText("Test")
+            self.model_test.setEnabled(bool(model))
 
     def select_saved_model(self, index: int) -> None:
         if index < 0:
             return
         model = self.model.itemText(index).strip()
         if model:
-            self.settings.setValue("api/model", model)
+            self.settings.setValue(f"{self.current_provider}/model", model)
             self.settings.sync()
         self.update_model_action()
 
@@ -671,10 +1633,94 @@ class SettingsDialog(QDialog):
         else:
             self.model.insertItem(0, model)
             self.model.setCurrentIndex(0)
-        self.settings.setValue("api/models", self.saved_models()[:20])
-        self.settings.setValue("api/model", self.model.currentText().strip())
+        self.settings.setValue(f"{self.current_provider}/models", self.saved_models()[:20])
+        self.settings.setValue(f"{self.current_provider}/model", self.model.currentText().strip())
         self.settings.sync()
         self.update_model_action()
+
+    def set_model_test_status(self, text: str, style: str = "") -> None:
+        self.model_test_animation.stop()
+        self.model_test_effect.setOpacity(1.0)
+        self.model_test_status.setStyleSheet(style)
+        self.model_test_status.setText(text)
+
+    def model_changed(self, _text: str) -> None:
+        if not self.loading_provider and self.test_worker is None:
+            self.set_model_test_status("Chưa test model")
+
+    def test_current_model(self) -> None:
+        if self.test_worker is not None:
+            self.test_worker.cancel()
+            self.model_test.setEnabled(False)
+            self.set_model_test_status("Đã hủy test")
+            return
+        errors: list[str] = []
+        self.persist_provider_fields(self.current_provider, errors)
+        if errors:
+            self.set_model_test_status("Không thể test: " + " ".join(errors))
+            return
+        provider = self.current_provider
+        model = self.model.currentText().strip()
+        try:
+            if provider == "openai":
+                config = {
+                    "endpoint": chat_endpoint(self.base_url.text().strip()),
+                    "api_key": self.api_key.text().strip(),
+                }
+            elif provider == "gemini":
+                keys = self.gemini_keys()
+                if not keys:
+                    raise ValueError("Chưa cấu hình Gemini API key.")
+                config = {"api_keys": keys}
+            elif provider == "codex":
+                bundle = load_codex_bundle(self.settings)
+                if not bundle.get("access_token") or not bundle.get("account_id"):
+                    raise ValueError("Chưa đăng nhập Codex.")
+                config = {"token_bundle": bundle}
+            else:
+                raise ValueError(f"Provider không hợp lệ: {provider}")
+        except Exception as error:
+            self.set_model_test_status(f"Không thể test: {error}")
+            return
+        messages = [{"role": "user", "content": "Reply with exactly: OK"}]
+        self.test_worker = ChatWorker(provider, model, messages, config)
+        self.test_worker.succeeded.connect(self.model_test_succeeded)
+        self.test_worker.failed.connect(self.model_test_failed)
+        self.test_worker.finished.connect(self.model_test_finished)
+        self.set_model_test_status(f"Đang test {model}…")
+        self.provider.setEnabled(False)
+        self.model.setEnabled(False)
+        self.model_test.setText("Hủy test")
+        self.model_test.setEnabled(True)
+        self.model_action.setEnabled(False)
+        self.test_worker.start()
+
+    def model_test_succeeded(self, _text: str) -> None:
+        self.set_model_test_status(
+            f"✓ Hoạt động: {self.model.currentText().strip()}",
+            "color: #55d68b; font-weight: 700;",
+        )
+        self.model_test_effect.setOpacity(0.0)
+        self.model_test_animation.start()
+
+    def model_test_failed(self, message: str) -> None:
+        self.set_model_test_status(
+            f"Thất bại: {message}", "color: #ff8d9e;"
+        )
+
+    def model_test_finished(self) -> None:
+        if self.test_worker is not None:
+            self.test_worker.deleteLater()
+        self.test_worker = None
+        self.provider.setEnabled(True)
+        self.model.setEnabled(True)
+        self.update_model_action()
+
+    def change_opacity(self, value: int) -> None:
+        self.opacity_value.setText(f"{value}%")
+        self.settings.setValue("window/opacity", value / 100)
+        if self.overlay is not None:
+            self.overlay.set_opacity_percent(value, update_panel=False)
 
     def apply_appearance(self) -> None:
         theme = self.theme.currentData()
@@ -692,6 +1738,12 @@ class SettingsDialog(QDialog):
                 background: {field}; border: 1px solid {border}; border-radius: 7px; padding: 6px;
             }}
             QComboBox QAbstractItemView {{ background: {field}; color: {text}; selection-background-color: {border}; }}
+            QTabWidget::pane {{ background: transparent; border: 1px solid {border}; border-radius: 7px; }}
+            QTabBar::tab {{ background: {field}; border: 1px solid {border}; min-width: 18px; padding: 3px 7px; }}
+            QTabBar::tab:first {{ border-top-left-radius: 6px; }}
+            QTabBar::tab:last {{ border-top-right-radius: 6px; font-weight: 700; }}
+            QTabBar::tab:selected {{ background: {border}; }}
+            QTabBar::close-button {{ subcontrol-position: right; }}
             QCheckBox {{ spacing: 7px; }}
             QPushButton {{ background: {field}; border: 1px solid {border}; border-radius: 7px; padding: 7px 12px; }}
             QPushButton:hover {{ background: {border}; }}
@@ -700,7 +1752,39 @@ class SettingsDialog(QDialog):
         )
 
     def schedule_auto_save(self, *_args) -> None:
-        self.autosave_timer.start()
+        if not self.loading_provider:
+            self.autosave_timer.start()
+
+    def choose_image_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Chọn folder lưu ảnh đã gửi",
+            self.image_folder.text().strip() or os.path.expandvars("%USERPROFILE%\\Pictures"),
+        )
+        if folder:
+            self.image_folder.setText(os.path.normpath(folder))
+            self.image_save_toggle.setChecked(True)
+            self.update_image_folder_buttons()
+            self.schedule_auto_save()
+
+    def open_image_folder(self) -> None:
+        folder = self.image_folder.text().strip()
+        if not os.path.isdir(folder):
+            QMessageBox.warning(self, "Folder lưu ảnh", "Folder đã chọn không còn tồn tại.")
+            return
+        os.startfile(folder)
+
+    def image_save_toggled(self, _enabled: bool) -> None:
+        self.update_image_folder_buttons()
+        self.schedule_auto_save()
+
+    def update_image_folder_buttons(self) -> None:
+        configured = bool(self.image_folder.text().strip())
+        if not configured and self.image_save_toggle.isChecked():
+            self.image_save_toggle.setChecked(False)
+        self.open_image_folder_button.setEnabled(configured)
+        self.image_save_toggle.setEnabled(configured)
+        self.image_folder.setEnabled(configured and self.image_save_toggle.isChecked())
 
     def change_resize_mode(self, allow_tiny: bool) -> None:
         self.settings.setValue("window/allow_tiny_resize", allow_tiny)
@@ -709,26 +1793,16 @@ class SettingsDialog(QDialog):
         self.schedule_auto_save()
 
     def save_settings(self, show_errors: bool = False) -> bool:
-        errors = []
-        try:
-            base_url = self.base_url.text().strip()
-            chat_endpoint(base_url)
-            self.settings.setValue("api/base_url", base_url)
-        except Exception as error:
-            errors.append(str(error))
-
-        model = self.model.currentText().strip()
-        if model:
-            self.settings.setValue("api/model", model)
-        else:
-            errors.append("Model không được để trống.")
-
-        try:
-            self.settings.setValue("api/key", protect_secret(self.api_key.text().strip()))
-        except Exception as error:
-            errors.append(str(error))
-        self.settings.setValue("api/models", list(dict.fromkeys(self.saved_models()))[:20])
+        errors: list[str] = []
+        self.current_provider = self.provider.currentData()
+        self.settings.setValue("provider/current", self.current_provider)
+        self.persist_provider_fields(self.current_provider, errors)
         self.settings.setValue("capture/image_prompt", self.image_prompt.toPlainText().strip())
+        self.settings.setValue("capture/save_folder", self.image_folder.text().strip())
+        self.settings.setValue(
+            "capture/save_enabled",
+            self.image_save_toggle.isChecked() and bool(self.image_folder.text().strip()),
+        )
         self.settings.setValue("window/always_on_top", self.always_on_top.isChecked())
         self.settings.setValue("window/keep_on_top", self.keep_on_top.isChecked())
         self.settings.setValue("capture/hide_overlay", self.hide_during_capture.isChecked())
@@ -757,12 +1831,20 @@ class SettingsDialog(QDialog):
             self.overlay.apply_size_settings()
             self.overlay.apply_top_settings()
             self.overlay.apply_appearance_settings()
-            self.overlay.setWindowOpacity(self.opacity.value() / 100)
+            self.overlay.set_opacity_percent(self.opacity.value(), update_panel=False)
         if show_errors and errors:
             QMessageBox.warning(self, "Một số cài đặt chưa hợp lệ", "\n".join(errors))
         return not errors
 
     def close_with_save(self) -> None:
+        if (
+            (self.oauth_worker is not None and self.oauth_worker.isRunning())
+            or (self.test_worker is not None and self.test_worker.isRunning())
+        ):
+            QMessageBox.information(
+                self, "Tác vụ đang chạy", "Hãy chờ đăng nhập hoặc test model hoàn tất trước khi đóng Cài đặt."
+            )
+            return
         self.autosave_timer.stop()
         self.save_settings(True)
         super().accept()
@@ -1069,6 +2151,23 @@ class OverlayWindow(QWidget):
             self.hide()
             self.tray.showMessage(APP_NAME, "Ứng dụng vẫn chạy dưới khay hệ thống.", msecs=1800)
 
+    def nativeEvent(self, event_type, message):  # noqa: N802 - Qt API
+        try:
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == WM_NCHITTEST and int(msg.hWnd) == int(self.winId()) and not self.click_through:
+                rect = wintypes.RECT()
+                if ctypes.windll.user32.GetWindowRect(int(self.winId()), ctypes.byref(rect)):
+                    lparam = int(msg.lParam)
+                    x = ctypes.c_short(lparam & 0xFFFF).value
+                    y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+                    border = max(6, round(8 * self.devicePixelRatioF()))
+                    hit = resize_hit_test(x, y, (rect.left, rect.top, rect.right, rect.bottom), border)
+                    if hit:
+                        return True, hit
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return super().nativeEvent(event_type, message)
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self.settings.setValue("window/size", self.size())
@@ -1128,11 +2227,20 @@ class OverlayWindow(QWidget):
             self.raise_()
             self.activateWindow()
 
+    def set_opacity_percent(self, percent: int, update_panel: bool = True) -> None:
+        percent = min(100, max(5, int(percent)))
+        self.setWindowOpacity(percent / 100)
+        self.settings.setValue("window/opacity", percent / 100)
+        if update_panel and self.settings_panel is not None:
+            self.settings_panel.opacity.blockSignals(True)
+            self.settings_panel.opacity.setValue(percent)
+            self.settings_panel.opacity.blockSignals(False)
+            self.settings_panel.opacity_value.setText(f"{percent}%")
+
     def adjust_opacity(self, delta: float) -> None:
-        value = min(1.0, max(0.05, self.windowOpacity() + delta))
-        self.setWindowOpacity(value)
-        self.settings.setValue("window/opacity", round(value, 2))
-        self.status.setText(f"Độ mờ: {round(value * 100)}%")
+        percent = round(self.windowOpacity() * 100) + round(delta * 100)
+        self.set_opacity_percent(percent)
+        self.status.setText(f"Độ hiển thị: {min(100, max(5, percent))}%")
 
     def eventFilter(self, watched, event) -> bool:
         if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
@@ -1210,7 +2318,19 @@ class OverlayWindow(QWidget):
         self.size_grip.raise_()
         self.compact_settings_button.raise_()
 
-    def close_settings(self, accepted: bool) -> None:
+    def close_settings(self, accepted: bool) -> bool:
+        if self.settings_panel is not None and (
+            (
+                self.settings_panel.oauth_worker is not None
+                and self.settings_panel.oauth_worker.isRunning()
+            )
+            or (
+                self.settings_panel.test_worker is not None
+                and self.settings_panel.test_worker.isRunning()
+            )
+        ):
+            self.status.setText("Hãy hủy hoặc chờ đăng nhập/test model hoàn tất trước khi chụp")
+            return False
         if self.settings_panel is not None:
             self.settings_panel.autosave_timer.stop()
             self.settings_panel.save_settings(False)
@@ -1230,6 +2350,7 @@ class OverlayWindow(QWidget):
             else "Phím tắt lỗi: " + ", ".join(self.hotkey_failures)
         )
         self.settings_panel = None
+        return True
 
     def append_bubble(self, role: str, text: str, image: bytes | None = None) -> None:
         row = QWidget()
@@ -1299,19 +2420,53 @@ class OverlayWindow(QWidget):
         ).strip()
         text = compose_image_prompt(image_prompt, question) if image is not None else question
         try:
-            endpoint = chat_endpoint(self.settings.value("api/base_url", "https://api.openai.com/v1", str))
-            api_key = unprotect_secret(self.settings.value("api/key", "", str))
-            model = self.settings.value("api/model", "gpt-4o-mini", str).strip()
+            provider = self.settings.value("provider/current", "openai", str)
+            presets = PROVIDER_MODELS.get(provider, [])
+            default_model = presets[0] if presets else "gpt-4o-mini" if provider == "openai" else ""
+            model = self.settings.value(f"{provider}/model", default_model, str).strip()
             if not model:
                 raise ValueError("Chưa cấu hình model.")
+            if provider == "openai":
+                config = {
+                    "endpoint": chat_endpoint(
+                        self.settings.value("openai/base_url", "https://api.openai.com/v1", str)
+                    ),
+                    "api_key": unprotect_secret(self.settings.value("openai/key", "", str)),
+                }
+            elif provider == "gemini":
+                keys = load_gemini_keys(self.settings)
+                if not keys:
+                    raise ValueError("Chưa cấu hình Gemini API key.")
+                config = {"api_keys": keys}
+            elif provider == "codex":
+                token_bundle = load_codex_bundle(self.settings)
+                if not token_bundle.get("access_token") or not token_bundle.get("account_id"):
+                    raise ValueError("Chưa đăng nhập Codex. Mở Cài đặt để đăng nhập bằng ChatGPT.")
+                config = {"token_bundle": token_bundle}
+            else:
+                raise ValueError(f"Provider không hợp lệ: {provider}")
         except Exception as error:
             self.append_bubble("error", str(error))
-            self.open_settings()
+            if not self.settings_scroll.isVisible():
+                self.open_settings()
             return
+
+        save_error = ""
+        saved_path = ""
+        if image:
+            folder = self.settings.value("capture/save_folder", "", str).strip()
+            if folder and self.settings.value("capture/save_enabled", bool(folder), bool):
+                try:
+                    saved_path = save_chat_image(folder, image)
+                except Exception as error:
+                    save_error = str(error)
+                    LOGGER.warning("image save failed type=%s", type(error).__name__)
 
         self.input.clear()
         self.clear_pending_image()
         self.append_bubble("user", question or image_prompt or "Ảnh đính kèm", image)
+        if save_error:
+            self.append_bubble("error", "Không lưu được bản sao ảnh: " + save_error)
         if image:
             encoded = base64.b64encode(image).decode("ascii")
             content = [
@@ -1321,8 +2476,8 @@ class OverlayWindow(QWidget):
         else:
             content = text
         self.messages.append({"role": "user", "content": content})
-        self.status.setText("AI đang trả lời…")
-        self.worker = ChatWorker(endpoint, api_key, model, list(self.messages))
+        self.status.setText("AI đang trả lời…" + (f" • đã lưu {os.path.basename(saved_path)}" if saved_path else ""))
+        self.worker = ChatWorker(provider, model, list(self.messages), config)
         self.worker.succeeded.connect(self.on_chat_success)
         self.worker.failed.connect(self.on_chat_error)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -1404,16 +2559,21 @@ class OverlayWindow(QWidget):
         self.attachment_preview.clear()
         self.attachment.hide()
 
+    def start_capture_from_hotkey(self) -> None:
+        if self.settings_scroll.isVisible() and not self.close_settings(False):
+            return
+        self.start_capture()
+
     def handle_hotkey(self, hotkey_id: int) -> None:
-        if self.settings_scroll.isVisible() and hotkey_id in (5, 6):
-            self.status.setText("Chọn vùng và gửi nội dung chỉ dùng trong Chat")
+        if self.settings_scroll.isVisible() and hotkey_id == 6:
+            self.status.setText("Gửi nội dung chỉ dùng trong Chat")
             return
         actions = {
             1: self.toggle_click_through,
             2: self.toggle_visible,
             3: lambda: self.adjust_opacity(-0.05),
             4: lambda: self.adjust_opacity(0.05),
-            5: self.start_capture,
+            5: self.start_capture_from_hotkey,
             6: self.submit,
             7: self.open_settings,
         }
@@ -1434,7 +2594,7 @@ def register_hotkeys(settings: QSettings) -> list[str]:
     for hotkey_id, (label, _) in HOTKEYS.items():
         text = hotkey_text(settings, hotkey_id)
         try:
-            modifiers, virtual_key = hotkey_to_win(text)
+            modifiers, virtual_key = hotkey_to_win(text, allow_repeat=hotkey_id in (3, 4))
             if not user32.RegisterHotKey(None, hotkey_id, modifiers, virtual_key):
                 failures.append(f"{label} ({text})")
         except ValueError:
@@ -1448,6 +2608,20 @@ def unregister_hotkeys() -> None:
 
 
 def self_check() -> None:
+    modifiers, _ = hotkey_to_win("Ctrl+[", allow_repeat=True)
+    assert modifiers & MOD_CONTROL and not modifiers & MOD_NOREPEAT
+    modifiers, _ = hotkey_to_win("Ctrl+M")
+    assert modifiers & MOD_NOREPEAT
+    assert resize_hit_test(1, 1, (0, 0, 100, 100), 8) == HTTOPLEFT
+    assert resize_hit_test(99, 50, (0, 0, 100, 100), 8) == HTRIGHT
+    assert resize_hit_test(50, 50, (0, 0, 100, 100), 8) == 0
+    with tempfile.TemporaryDirectory() as folder:
+        first = save_chat_image(folder, b"png-one", "20260101_000000_000")
+        second = save_chat_image(folder, b"png-two", "20260101_000000_000")
+        assert first.endswith("OverlayAI_20260101_000000_000.png")
+        assert second.endswith("OverlayAI_20260101_000000_000_1.png")
+        with open(first, "rb") as saved:
+            assert saved.read() == b"png-one"
     assert chat_endpoint("https://api.example.test/v1/") == "https://api.example.test/v1/chat/completions"
     assert chat_endpoint("https://api.example.test/v1/chat/completions") == "https://api.example.test/v1/chat/completions"
     assert compose_image_prompt("Phân tích ảnh", "Giải câu 2") == "Phân tích ảnh\n\nGiải câu 2"
@@ -1462,6 +2636,65 @@ def self_check() -> None:
     assert assistant_text({"response": "ollama-style"}) == "ollama-style"
     assert assistant_text({"choices": []}) == ""
     assert "choices=0" in response_schema({"choices": []})
+    verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    assert pkce_challenge(verifier) == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    auth_query = urllib.parse.parse_qs(urllib.parse.urlparse(codex_authorization_url("s", "c")).query)
+    assert auth_query["state"] == ["s"] and auth_query["code_challenge"] == ["c"]
+    assert oauth_callback_code("/auth/callback?state=s&code=code", "s") == "code"
+    try:
+        oauth_callback_code("/auth/callback?state=wrong&code=code", "s")
+        raise AssertionError("state mismatch was accepted")
+    except ValueError:
+        pass
+    fake_claims = base64url(json.dumps({"email": "a@example.test", "chatgpt_account_id": "acc"}).encode())
+    assert token_identity(f"x.{fake_claims}.y") == ("acc", "a@example.test")
+    redacted = safe_response_log(
+        'Bearer bearer-secret {"access_token":"token-secret","account_id":"account-secret",'
+        '"id_token":"eyJh.eyJi.YyJ9"}'
+    )
+    assert "bearer-secret" not in redacted
+    assert "token-secret" not in redacted and "account-secret" not in redacted and "eyJh" not in redacted
+    messages = [
+        {"role": "system", "content": "system"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "question"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+        },
+        {"role": "assistant", "content": "answer"},
+    ]
+    codex = codex_payload("model", messages)
+    assert codex["instructions"] == "system" and codex["input"][0]["content"][1]["type"] == "input_image"
+    gemini = gemini_payload(messages)
+    assert gemini["systemInstruction"]["parts"][0]["text"] == "system"
+    assert gemini["contents"][0]["parts"][1]["inlineData"]["data"] == "AA=="
+    assert gemini_text({"candidates": [{"content": {"parts": [{"text": "gemini"}]}}]}) == "gemini"
+    sse = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hel"}\n\n' \
+        'data: {"type":"response.output_text.delta","delta":"lo"}\n\n'
+    assert codex_sse_text(sse) == ("hello", True)
+    assert codex_sse_text('{"output_text":"json fallback"}') == ("json fallback", False)
+    assert len(PROVIDER_MODELS["gemini"]) == 8 and PROVIDER_MODELS["gemini"][0] == "gemini-3.7-flash"
+    assert "gemini-3.5-flash" in PROVIDER_MODELS["gemini"]
+    assert not any(model.startswith("gemini-2.5-") for model in PROVIDER_MODELS["gemini"])
+    assert normalize_gemini_keys([" key-1 ", "", "key-2", "key-1"]) == ["key-1", "key-2"]
+    rotated = rotated_gemini_keys(["key-1", "key-2", "key-3"])
+    assert len(rotated) == 3 and set(rotated) == {"key-1", "key-2", "key-3"}
+    assert len(PROVIDER_MODELS["codex"]) == 12 and PROVIDER_MODELS["codex"][0] == "gpt-5.6-sol"
+    assert len(set(PROVIDER_MODELS["gemini"] + PROVIDER_MODELS["codex"])) == 20
+    with tempfile.TemporaryDirectory() as folder:
+        test_settings = QSettings(os.path.join(folder, "settings.ini"), QSettings.Format.IniFormat)
+        test_settings.setValue("gemini/models", ["gemini-2.5-pro", "custom-model"])
+        test_settings.setValue("gemini/model", "gemini-2.5-pro")
+        test_settings.setValue("gemini/key", protect_secret("legacy-key"))
+        migrate_provider_settings(test_settings)
+        migrated_models = test_settings.value("gemini/models", [])
+        assert "gemini-2.5-pro" not in migrated_models and "custom-model" in migrated_models
+        assert migrated_models.count("gemini-3.5-flash") == 1
+        assert test_settings.value("gemini/model", "", str) == "gemini-3.7-flash"
+        assert load_gemini_keys(test_settings) == ["legacy-key"]
+        assert not test_settings.contains("gemini/key")
     print("self-check: ok")
 
 
@@ -1479,6 +2712,7 @@ def main() -> int:
     app.setOrganizationName(ORG_NAME)
     app.setQuitOnLastWindowClosed(False)
     settings = QSettings()
+    migrate_provider_settings(settings)
 
     window = OverlayWindow(settings)
     native_filter = HotkeyFilter(window.handle_hotkey)
