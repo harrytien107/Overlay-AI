@@ -7,13 +7,14 @@
 ## Tính năng
 
 - Overlay trong suốt, không viền, always-on-top, click-through và khay hệ thống.
-- Resize từ bốn cạnh/bốn góc, điều chỉnh opacity từ `5%` đến `100%` và ba theme Đen/Xám/Trắng. Thanh trượt và phím tắt đồng bộ theo thời gian thực.
+- Resize từ bốn cạnh/bốn góc, điều chỉnh opacity từ `5%` đến `100%` và ba theme Đen/Xám/Trắng. Thanh trượt, phím tắt và popup dropdown trong Cài đặt dùng chung opacity theo thời gian thực.
 - Cài đặt nằm trong overlay, responsive và tự động lưu.
 - Chụp vùng trên nhiều màn hình; ảnh được đính kèm trước khi gửi và có thể lưu bản sao vào folder đã chọn. `Ctrl+E` trong Cài đặt tự lưu, chuyển về Chat rồi mở vùng chụp.
 - Chat văn bản/ảnh qua OpenAI-compatible, Gemini API hoặc Codex OAuth thử nghiệm.
-- Render câu trả lời bằng Markdown và tự cuộn nội dung.
-- Lưu model riêng theo provider; mã hóa API key, danh sách Gemini API key và phiên Codex bằng Windows DPAPI.
-- Hỗ trợ bảy phím tắt toàn cục có thể tùy chỉnh.
+- Render câu trả lời bằng Markdown và tự cuộn nội dung. Câu trả lời AI giãn theo gần toàn bộ chiều rộng khung chat; bubble người dùng giữ tối đa `72%`.
+- Tạo session mới bằng `Ctrl+N`: xóa lịch sử chat và ảnh chờ, giữ nội dung đang gõ; thao tác bị chặn khi AI đang trả lời. Profile Gemini Web2API có thể tạo conversation mới trên server trước khi reset cục bộ.
+- Lưu model riêng theo provider; lưu nhiều OpenAI-compatible profile gồm Base URL, API key, model và tùy chọn Gemini Web2API; mã hóa profiles, Gemini API keys và phiên Codex bằng Windows DPAPI.
+- Hỗ trợ tám phím tắt toàn cục có thể tùy chỉnh bằng bàn phím hoặc Mouse4/Mouse5.
 
 ## Cài đặt và chạy
 
@@ -27,14 +28,14 @@ python -m venv .venv
 
 Trong Cài đặt, chọn provider rồi cấu hình:
 
-- **OpenAI-compatible:** Base URL, model và API key. Provider phải hỗ trợ Chat Completions; gửi ảnh cần hỗ trợ data URL.
+- **OpenAI-compatible:** nhập Base URL, model và API key rồi bấm **Lưu profile**. Mỗi profile giữ API key, danh sách model, model đang chọn và tùy chọn **Gemini Web2API** riêng. Dropdown hiển thị toàn bộ Base URL; chọn một URL sẽ thay toàn bộ cấu hình này. URL chưa lưu chỉ hiện **Lưu profile** và mặc định tắt Gemini Web2API; URL đã lưu chỉ hiện **Xóa**, các thay đổi được tự động lưu. **Xóa** bỏ profile nhưng giữ các giá trị đang nhập. Provider phải hỗ trợ Chat Completions; gửi ảnh cần hỗ trợ data URL.
 - **Gemini API:** chọn model gợi ý hoặc nhập model khác. Mỗi tab số chứa một API key từ Google AI Studio; tab `+` luôn nằm sát tab số cuối để thêm key và `×` xóa tab. Ứng dụng xoay vòng key theo request và thử key kế tiếp khi Gemini trả `401`, `403` hoặc `429`.
 - **Codex OAuth (thử nghiệm):** chọn model gợi ý hoặc nhập model khác, bấm **Đăng nhập**, hoàn tất trong trình duyệt rồi quay lại ứng dụng. Nút đổi thành **Đăng xuất** khi có phiên và xóa phiên cục bộ khi bấm.
 - Nút **Test** gửi prompt tối thiểu qua model đang chọn và hiển thị kết quả trong Cài đặt; request này không được thêm vào lịch sử chat. Trong khi request chạy, nút đổi thành **Hủy test**.
 - **Folder lưu ảnh đã gửi** cho phép chọn bằng nút icon folder, mở và bật/tắt lưu bằng công tắc có animation. Toàn bộ công tắc nhận click. Tắt lưu vẫn giữ folder để bật lại nhanh. Chỉ ảnh thực sự được gửi mới được sao chép; lỗi ghi file không chặn request chat.
 - Prompt dùng khi gửi ảnh áp dụng cho cả ba provider.
 
-Cấu hình OpenAI-compatible cũ được chuyển một lần sang vùng cấu hình provider mới. Mỗi provider có danh sách model riêng; mọi model gợi ý đều có thể xóa và model tự nhập có thể lưu lại. Danh sách gợi ý không bảo đảm model đang tồn tại hoặc account hiện tại có quyền sử dụng; dùng **Test** để kiểm tra qua provider thật.
+Cấu hình OpenAI-compatible cũ được chuyển một lần thành profile đầu tiên. Mỗi provider có danh sách model riêng; mọi model gợi ý đều có thể xóa và model tự nhập có thể lưu lại. Danh sách gợi ý không bảo đảm model đang tồn tại hoặc account hiện tại có quyền sử dụng; dùng **Test** để kiểm tra qua provider thật.
 
 ### Cảnh báo Codex OAuth
 
@@ -55,8 +56,11 @@ API key và token bundle được mã hóa bằng Windows DPAPI cho tài khoản
 | Bật/tắt chọn vùng | `Ctrl+E` |
 | Gửi nội dung | `Ctrl+Enter` |
 | Mở/đóng Cài đặt | `Ctrl+H` |
+| Tạo session mới | `Ctrl+N` |
 
-Có thể thay đổi các tổ hợp này trong Cài đặt. Mỗi tổ hợp cần ít nhất một modifier `Ctrl`, `Alt`, `Shift` hoặc `Win` và không được trùng nhau. Có thể giữ phím giảm/tăng opacity để thay đổi liên tục theo keyboard repeat của Windows; các hotkey khác vẫn chống lặp. Khi Cài đặt đang mở, phím chụp tự lưu cấu hình và chuyển về Chat; phím gửi vẫn bị chặn để tránh gửi ngoài ý muốn.
+Có thể thay đổi các tổ hợp này trong Cài đặt. Hotkey bàn phím cần ít nhất một modifier `Ctrl`, `Alt`, `Shift` hoặc `Win`; Mouse4/Mouse5 dùng riêng hoặc kèm modifier, ví dụ `Ctrl+Mouse4` và `Alt+Mouse5`. Các tổ hợp không được trùng nhau. Mouse hotkey không chặn click gốc nên ứng dụng đang dùng vẫn nhận Mouse4/Mouse5. Có thể giữ phím giảm/tăng opacity để thay đổi liên tục theo keyboard repeat của Windows; các hotkey khác vẫn chống lặp. Khi Cài đặt đang mở, phím chụp tự lưu cấu hình và chuyển về Chat; phím gửi vẫn bị chặn để tránh gửi ngoài ý muốn.
+
+Với OpenAI-compatible profile bật **Gemini Web2API**, `Ctrl+N` gửi `POST {}` đến endpoint `/v1/conversations`. Chỉ HTTP `201` mới được xem là thành công; sau đó ứng dụng xóa lịch sử và ảnh chờ cục bộ nhưng giữ draft. Lỗi mạng, timeout hoặc status khác `201` giữ nguyên toàn bộ history, ảnh chờ và draft rồi hiển thị lỗi. Profile không bật tùy chọn này và các provider khác chỉ reset cục bộ.
 
 ## Kiểm tra
 

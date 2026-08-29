@@ -30,6 +30,7 @@ from PySide6.QtCore import (
     QEvent,
     QIODevice,
     QPoint,
+    QObject,
     Property,
     QPropertyAnimation,
     QRect,
@@ -65,7 +66,6 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
-    QKeySequenceEdit,
     QLineEdit,
     QMenu,
     QMessageBox,
@@ -158,7 +158,17 @@ HOTKEYS = {
     5: ("Bật/tắt chọn vùng", "Ctrl+E"),
     6: ("Gửi nội dung", "Ctrl+Enter"),
     7: ("Mở Cài đặt", "Ctrl+H"),
+    8: ("Tạo session mới", "Ctrl+N"),
 }
+WH_MOUSE_LL = 14
+WM_XBUTTONDOWN = 0x020B
+XBUTTON1 = 0x0001
+XBUTTON2 = 0x0002
+VK_SHIFT = 0x10
+VK_CONTROL = 0x11
+VK_MENU = 0x12
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
 LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.getcwd()), "OverlayAI")
 LOG_PATH = os.path.join(LOG_DIR, "overlay-ai.log")
 SYSTEM_INSTRUCTION = (
@@ -198,8 +208,72 @@ def hotkey_text(settings: QSettings, hotkey_id: int) -> str:
     return settings.value(f"hotkeys/{hotkey_id}", HOTKEYS[hotkey_id][1], str)
 
 
+def mouse_hotkey_parts(text: str) -> tuple[int, str] | None:
+    parts = [part.strip() for part in text.split("+") if part.strip()]
+    if not parts or parts[-1].lower() not in ("mouse4", "mouse5"):
+        return None
+    modifier_map = {
+        "ctrl": MOD_CONTROL,
+        "control": MOD_CONTROL,
+        "alt": MOD_ALT,
+        "shift": MOD_SHIFT,
+        "win": MOD_WIN,
+        "meta": MOD_WIN,
+    }
+    modifiers = 0
+    for part in parts[:-1]:
+        flag = modifier_map.get(part.lower())
+        if flag is None or modifiers & flag:
+            raise ValueError(f"Phím tắt chuột không hợp lệ: {text}")
+        modifiers |= flag
+    return modifiers, parts[-1].title()
+
+
+def format_mouse_hotkey(modifiers: Qt.KeyboardModifier, button: str) -> str:
+    parts = []
+    if modifiers & Qt.KeyboardModifier.ControlModifier:
+        parts.append("Ctrl")
+    if modifiers & Qt.KeyboardModifier.AltModifier:
+        parts.append("Alt")
+    if modifiers & Qt.KeyboardModifier.ShiftModifier:
+        parts.append("Shift")
+    if modifiers & Qt.KeyboardModifier.MetaModifier:
+        parts.append("Win")
+    return "+".join(parts + [button])
+
+
 def normalize_gemini_keys(keys) -> list[str]:
     return list(dict.fromkeys(str(key).strip() for key in keys if str(key).strip()))
+
+
+def normalize_openai_profiles(profiles) -> list[dict]:
+    normalized: dict[str, dict] = {}
+    if not isinstance(profiles, list):
+        return []
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        base_url = str(profile.get("base_url", "")).strip().rstrip("/")
+        model = str(profile.get("model", "")).strip()
+        if not base_url:
+            continue
+        stored_models = profile.get("models", [])
+        if isinstance(stored_models, str):
+            stored_models = [stored_models]
+        models = list(
+            dict.fromkeys(
+                [str(item).strip() for item in stored_models if str(item).strip()]
+                + ([model] if model else [])
+            )
+        )[:20]
+        normalized[base_url] = {
+            "base_url": base_url,
+            "model": model,
+            "models": models,
+            "api_key": str(profile.get("api_key", "")).strip(),
+            "gemini_web2api": bool(profile.get("gemini_web2api", False)),
+        }
+    return list(normalized.values())[-20:]
 
 
 def rotated_gemini_keys(keys: list[str]) -> list[str]:
@@ -213,6 +287,8 @@ def rotated_gemini_keys(keys: list[str]) -> list[str]:
 
 
 def hotkey_to_win(text: str, allow_repeat: bool = False) -> tuple[int, int]:
+    if mouse_hotkey_parts(text) is not None:
+        raise ValueError(f"Phím tắt chuột không thể đăng ký bằng RegisterHotKey: {text}")
     sequence = QKeySequence.fromString(text, QKeySequence.SequenceFormat.PortableText)
     if sequence.isEmpty() or sequence.count() != 1:
         raise ValueError(f"Phím tắt không hợp lệ: {text}")
@@ -307,6 +383,21 @@ def load_gemini_keys(settings: QSettings) -> list[str]:
 def save_gemini_keys(settings: QSettings, keys) -> None:
     normalized = normalize_gemini_keys(keys)
     settings.setValue("gemini/keys", protect_secret(json.dumps(normalized)))
+
+
+def load_openai_profiles(settings: QSettings) -> list[dict]:
+    encrypted = settings.value("openai/profiles", "", str)
+    if not encrypted:
+        return []
+    payload = json.loads(unprotect_secret(encrypted))
+    if not isinstance(payload, list):
+        raise ValueError("Danh sách OpenAI-compatible profile đã lưu không hợp lệ.")
+    return normalize_openai_profiles(payload)
+
+
+def save_openai_profiles(settings: QSettings, profiles) -> None:
+    normalized = normalize_openai_profiles(profiles)
+    settings.setValue("openai/profiles", protect_secret(json.dumps(normalized)))
 
 
 def configure_logging() -> logging.Logger:
@@ -446,6 +537,20 @@ def migrate_provider_settings(settings: QSettings) -> None:
             settings.remove("gemini/key")
         except Exception as error:
             LOGGER.warning("Gemini legacy key migration failed type=%s", type(error).__name__)
+
+    if not settings.contains("openai/profiles") and any(
+        settings.contains(key) for key in ("openai/base_url", "openai/model", "openai/key")
+    ):
+        try:
+            base_url = settings.value("openai/base_url", "https://api.openai.com/v1", str).strip()
+            model = settings.value("openai/model", "gpt-4o-mini", str).strip()
+            api_key = unprotect_secret(settings.value("openai/key", "", str))
+            save_openai_profiles(
+                settings,
+                [{"base_url": base_url, "model": model, "models": [model], "api_key": api_key}],
+            )
+        except Exception as error:
+            LOGGER.warning("OpenAI profile migration failed type=%s", type(error).__name__)
     settings.sync()
 
 
@@ -718,6 +823,16 @@ def chat_endpoint(base_url: str) -> str:
     return f"{value}/chat/completions"
 
 
+def conversations_endpoint(base_url: str) -> str:
+    value = base_url.strip().rstrip("/")
+    if not value:
+        raise ValueError("Base URL không được để trống.")
+    suffix = "/chat/completions"
+    if value.endswith(suffix):
+        value = value[: -len(suffix)]
+    return f"{value}/conversations"
+
+
 def compose_image_prompt(image_prompt: str, question: str) -> str:
     combined = "\n\n".join(part.strip() for part in (image_prompt, question) if part.strip())
     return combined or "Hãy phân tích ảnh này."
@@ -818,6 +933,124 @@ class HotkeyFilter(QAbstractNativeEventFilter):
         return False, 0
 
 
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt", wintypes.POINT),
+        ("mouseData", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class MouseHotkeyHook(QObject):
+    triggered = Signal(int)
+
+    def __init__(self, callback):
+        super().__init__()
+        self.triggered.connect(callback)
+        self.bindings: dict[tuple[int, str], int] = {}
+        self.handle = None
+        self._proc = None
+
+    @staticmethod
+    def current_modifiers() -> int:
+        user32 = ctypes.windll.user32
+        modifiers = 0
+        if user32.GetAsyncKeyState(VK_CONTROL) & 0x8000:
+            modifiers |= MOD_CONTROL
+        if user32.GetAsyncKeyState(VK_MENU) & 0x8000:
+            modifiers |= MOD_ALT
+        if user32.GetAsyncKeyState(VK_SHIFT) & 0x8000:
+            modifiers |= MOD_SHIFT
+        if (user32.GetAsyncKeyState(VK_LWIN) | user32.GetAsyncKeyState(VK_RWIN)) & 0x8000:
+            modifiers |= MOD_WIN
+        return modifiers
+
+    def update_bindings(self, settings: QSettings) -> list[str]:
+        bindings: dict[tuple[int, str], int] = {}
+        failures = []
+        for hotkey_id, (label, _) in HOTKEYS.items():
+            text = hotkey_text(settings, hotkey_id)
+            try:
+                parts = mouse_hotkey_parts(text)
+            except ValueError:
+                failures.append(f"{label} ({text})")
+                continue
+            if parts is None:
+                continue
+            if parts in bindings:
+                failures.append(f"{label} ({text})")
+                continue
+            bindings[parts] = hotkey_id
+        self.bindings = bindings
+        if not bindings:
+            self.uninstall()
+            return failures
+        if self.handle is None:
+            try:
+                self.install()
+            except OSError as error:
+                LOGGER.error("mouse hotkey hook install failed: %s", error)
+                failures.extend(
+                    f"{HOTKEYS[hotkey_id][0]} ({hotkey_text(settings, hotkey_id)})"
+                    for hotkey_id in bindings.values()
+                )
+        return failures
+
+    def install(self) -> None:
+        if self.handle is not None:
+            return
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        procedure_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+        )
+        user32.SetWindowsHookExW.argtypes = [
+            ctypes.c_int,
+            procedure_type,
+            wintypes.HINSTANCE,
+            wintypes.DWORD,
+        ]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.CallNextHookEx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+
+        def procedure(code, message, data):
+            if code >= 0 and message == WM_XBUTTONDOWN:
+                event = ctypes.cast(data, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                xbutton = (event.mouseData >> 16) & 0xFFFF
+                button = {XBUTTON1: "Mouse4", XBUTTON2: "Mouse5"}.get(xbutton)
+                if button is not None:
+                    hotkey_id = self.bindings.get((self.current_modifiers(), button))
+                    if hotkey_id is not None:
+                        self.triggered.emit(hotkey_id)
+            return user32.CallNextHookEx(self.handle, code, message, data)
+
+        self._proc = procedure_type(procedure)
+        self.handle = user32.SetWindowsHookExW(
+            WH_MOUSE_LL, self._proc, kernel32.GetModuleHandleW(None), 0
+        )
+        if not self.handle:
+            self._proc = None
+            raise ctypes.WinError()
+
+    def uninstall(self) -> None:
+        if self.handle is not None:
+            ctypes.windll.user32.UnhookWindowsHookEx(self.handle)
+        self.handle = None
+        self._proc = None
+
+
 class CodexOAuthWorker(QThread):
     succeeded = Signal(dict)
     failed = Signal(str)
@@ -879,6 +1112,53 @@ class CodexOAuthWorker(QThread):
             self.succeeded.emit(bundle)
         except Exception as error:
             LOGGER.error("Codex OAuth failed: %s", type(error).__name__)
+            self.failed.emit(str(error))
+
+
+class ConversationCreateWorker(QThread):
+    succeeded = Signal()
+    failed = Signal(str)
+
+    def __init__(self, endpoint: str, api_key: str):
+        super().__init__()
+        self.endpoint = endpoint
+        self.api_key = api_key
+
+    def run(self) -> None:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": f"OverlayAI/{APP_VERSION} (Gemini Web2API client)",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(
+            self.endpoint, data=b"{}", headers=headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                status = response.getcode()
+                details = response.read(1200).decode("utf-8", errors="replace")
+            if status != 201:
+                raise RuntimeError(
+                    f"Gemini Web2API trả HTTP {status}, cần HTTP 201. "
+                    + safe_response_log(details)
+                )
+            self.succeeded.emit()
+        except urllib.error.HTTPError as error:
+            details = error.read(1200).decode("utf-8", errors="replace")
+            LOGGER.error(
+                "Gemini Web2API conversation create failed status=%d body=%s",
+                error.code,
+                safe_response_log(details),
+            )
+            self.failed.emit(
+                f"Gemini Web2API HTTP {error.code}: " + safe_response_log(details)
+            )
+        except Exception as error:
+            LOGGER.error(
+                "Gemini Web2API conversation create failed type=%s", type(error).__name__
+            )
             self.failed.emit(str(error))
 
 
@@ -1077,9 +1357,50 @@ class SubmitLineEdit(QLineEdit):
         super().keyPressEvent(event)
 
 
+class HotkeyEdit(QLineEdit):
+    def __init__(self, value: str = ""):
+        super().__init__(value)
+        self.setReadOnly(True)
+        self.setClearButtonEnabled(True)
+        self.setPlaceholderText("Nhấn phím hoặc Mouse4/Mouse5")
+
+    def hotkeyText(self) -> str:  # noqa: N802 - Qt-style API
+        return self.text().strip()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            self.clear()
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Control, Qt.Key.Key_Alt, Qt.Key.Key_Shift, Qt.Key.Key_Meta):
+            event.accept()
+            return
+        value = QKeySequence(event.keyCombination()).toString(
+            QKeySequence.SequenceFormat.PortableText
+        )
+        if value:
+            self.setText(value)
+        event.accept()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        button = {
+            Qt.MouseButton.BackButton: "Mouse4",
+            Qt.MouseButton.ForwardButton: "Mouse5",
+        }.get(event.button())
+        if button:
+            self.setText(format_mouse_hotkey(event.modifiers(), button))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class NoWheelComboBox(QComboBox):
     def wheelEvent(self, event) -> None:
         event.ignore()
+
+    def showPopup(self) -> None:  # noqa: N802 - Qt API
+        super().showPopup()
+        self.view().window().setWindowOpacity(self.window().windowOpacity())
 
 
 class NoWheelSlider(QSlider):
@@ -1158,7 +1479,22 @@ class SettingsDialog(QDialog):
         provider_index = self.provider.findData(self.current_provider)
         self.provider.setCurrentIndex(max(0, provider_index))
         self.current_provider = self.provider.currentData()
-        self.base_url = QLineEdit()
+        self.base_url = NoWheelComboBox()
+        self.base_url.setEditable(True)
+        self.base_url.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.base_url_save = QPushButton("Lưu profile")
+        self.base_url_save.setToolTip("Lưu Base URL, API key và model hiện tại")
+        self.base_url_save.clicked.connect(self.save_openai_profile)
+        self.base_url_delete = QPushButton("Xóa")
+        self.base_url_delete.setToolTip("Xóa profile có Base URL đang chọn")
+        self.base_url_delete.clicked.connect(self.delete_openai_profile)
+        self.base_url_row = QWidget()
+        self.base_url_layout = QHBoxLayout(self.base_url_row)
+        self.base_url_layout.setContentsMargins(0, 0, 0, 0)
+        self.base_url_layout.setSpacing(6)
+        self.base_url_layout.addWidget(self.base_url, 1)
+        self.base_url_layout.addWidget(self.base_url_save)
+        self.base_url_layout.addWidget(self.base_url_delete)
         self.model = NoWheelComboBox()
         self.model.setEditable(True)
         self.model_row = QWidget()
@@ -1191,6 +1527,12 @@ class SettingsDialog(QDialog):
         self.model.editTextChanged.connect(self.model_changed)
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gemini_web2api = QCheckBox(
+            "Gemini Web2API: Ctrl+N tạo conversation mới trên server"
+        )
+        self.gemini_web2api.setToolTip(
+            "Gọi POST /v1/conversations và chỉ xóa chat cục bộ khi server trả HTTP 201"
+        )
         self.gemini_key_tabs = QTabWidget()
         self.gemini_key_tabs.setDocumentMode(True)
         self.gemini_key_tabs.setTabsClosable(True)
@@ -1287,10 +1629,11 @@ class SettingsDialog(QDialog):
         self.form = QFormLayout()
         self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.form.addRow("Provider", self.provider)
-        self.form.addRow("Base URL", self.base_url)
+        self.form.addRow("Base URL", self.base_url_row)
         self.form.addRow("Model", self.model_row)
         self.form.addRow("Trạng thái model", self.model_test_status)
         self.form.addRow("API key", self.api_key)
+        self.form.addRow("", self.gemini_web2api)
         self.form.addRow("Gemini API keys", self.gemini_key_tabs)
         self.form.addRow("Tài khoản Codex", self.codex_status)
         self.form.addRow("", self.codex_action)
@@ -1310,11 +1653,9 @@ class SettingsDialog(QDialog):
         shortcut_title.setStyleSheet("font-size: 15px; font-weight: 700; margin-top: 8px;")
         self.shortcut_form = QFormLayout()
         self.shortcut_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        self.hotkey_edits: dict[int, QKeySequenceEdit] = {}
+        self.hotkey_edits: dict[int, HotkeyEdit] = {}
         for hotkey_id, (label, _) in HOTKEYS.items():
-            edit = QKeySequenceEdit(QKeySequence.fromString(hotkey_text(settings, hotkey_id)))
-            edit.setClearButtonEnabled(True)
-            edit.setMaximumSequenceLength(1)
+            edit = HotkeyEdit(hotkey_text(settings, hotkey_id))
             self.hotkey_edits[hotkey_id] = edit
             self.shortcut_form.addRow(label, edit)
 
@@ -1328,8 +1669,8 @@ class SettingsDialog(QDialog):
         shortcut_status.setStyleSheet("color: #79d9a6;" if not failures else "color: #ff8d9e;")
 
         note = QLabel(
-            "Tự động lưu. API key và phiên Codex được mã hóa bằng Windows DPAPI "
-            "cho tài khoản Windows hiện tại."
+            "Tự động lưu. OpenAI-compatible profiles, Gemini API keys và phiên Codex "
+            "được mã hóa bằng Windows DPAPI cho tài khoản Windows hiện tại."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #93a4bd;")
@@ -1348,8 +1689,12 @@ class SettingsDialog(QDialog):
         self.autosave_timer.setSingleShot(True)
         self.autosave_timer.setInterval(350)
         self.autosave_timer.timeout.connect(self.save_settings)
-        for edit in (self.base_url, self.api_key):
-            edit.textChanged.connect(self.schedule_auto_save)
+        self.base_url.currentIndexChanged.connect(self.select_openai_profile)
+        self.base_url.editTextChanged.connect(self.update_openai_profile_actions)
+        self.base_url.editTextChanged.connect(self.schedule_auto_save)
+        self.api_key.textChanged.connect(self.schedule_auto_save)
+        self.gemini_web2api.toggled.connect(self.sync_active_openai_profile_models)
+        self.gemini_web2api.toggled.connect(self.schedule_auto_save)
         self.provider.currentIndexChanged.connect(self.change_provider)
         self.model.editTextChanged.connect(self.schedule_auto_save)
         self.image_prompt.textChanged.connect(self.schedule_auto_save)
@@ -1365,7 +1710,7 @@ class SettingsDialog(QDialog):
         self.allow_tiny_resize.toggled.connect(self.change_resize_mode)
         self.theme.currentIndexChanged.connect(self.schedule_auto_save)
         for edit in self.hotkey_edits.values():
-            edit.editingFinished.connect(self.schedule_auto_save)
+            edit.textChanged.connect(self.schedule_auto_save)
 
         self.load_provider_fields(self.current_provider)
         self.loading_provider = False
@@ -1388,11 +1733,13 @@ class SettingsDialog(QDialog):
         )
         self.form.setRowWrapPolicy(policy)
         self.shortcut_form.setRowWrapPolicy(policy)
-        self.model_layout.setDirection(
+        direction = (
             QHBoxLayout.Direction.TopToBottom
             if available_width < 390
             else QHBoxLayout.Direction.LeftToRight
         )
+        self.base_url_layout.setDirection(direction)
+        self.model_layout.setDirection(direction)
 
     def provider_default_model(self, provider: str) -> str:
         presets = PROVIDER_MODELS.get(provider, [])
@@ -1456,24 +1803,170 @@ class SettingsDialog(QDialog):
             self.add_gemini_key_tab(key)
         self.gemini_key_tabs.setCurrentIndex(0)
 
+    def base_url_text(self) -> str:
+        return self.base_url.currentText().strip()
+
+    def refresh_openai_profiles(self, profiles, current_url: str = "") -> None:
+        self.openai_profiles = normalize_openai_profiles(profiles)
+        current_url = current_url.strip().rstrip("/")
+        self.base_url.blockSignals(True)
+        self.base_url.clear()
+        for profile in self.openai_profiles:
+            self.base_url.addItem(profile["base_url"], profile)
+        index = self.base_url.findText(current_url)
+        self.base_url.setCurrentIndex(index)
+        if index < 0:
+            self.base_url.setEditText(current_url)
+        self.base_url.blockSignals(False)
+        self.update_openai_profile_actions()
+
+    def update_openai_profile_actions(self, *_args) -> None:
+        base_url = self.base_url_text().rstrip("/")
+        profile = next(
+            (profile for profile in self.openai_profiles if profile["base_url"] == base_url),
+            None,
+        )
+        saved = profile is not None
+        enabled = self.current_provider == "openai" and self.test_worker is None
+        self.base_url_save.setVisible(not saved)
+        self.base_url_save.setEnabled(enabled and bool(base_url) and not saved)
+        self.base_url_delete.setVisible(saved)
+        self.base_url_delete.setEnabled(enabled and saved)
+        self.gemini_web2api.blockSignals(True)
+        self.gemini_web2api.setChecked(bool(profile and profile["gemini_web2api"]))
+        self.gemini_web2api.blockSignals(False)
+
+    def set_model_choices(self, models, current_model: str) -> None:
+        choices = list(
+            dict.fromkeys(
+                [str(item).strip() for item in models if str(item).strip()]
+                + ([current_model.strip()] if current_model.strip() else [])
+            )
+        )[:20]
+        self.model.blockSignals(True)
+        self.model.clear()
+        self.model.addItems(choices)
+        self.model.setCurrentText(current_model.strip())
+        self.model.blockSignals(False)
+
+    def sync_active_openai_profile_models(self) -> None:
+        if self.loading_provider or self.current_provider != "openai":
+            return
+        base_url = self.base_url_text().rstrip("/")
+        model = self.model.currentText().strip()
+        models = list(dict.fromkeys(self.saved_models() + ([model] if model else [])))[:20]
+        changed = False
+        profiles = []
+        for profile in self.openai_profiles:
+            if profile["base_url"] == base_url:
+                profile = dict(profile)
+                profile["model"] = model
+                profile["models"] = models
+                profile["api_key"] = self.api_key.text().strip()
+                profile["gemini_web2api"] = self.gemini_web2api.isChecked()
+                changed = True
+            profiles.append(profile)
+        if changed:
+            save_openai_profiles(self.settings, profiles)
+            self.openai_profiles = normalize_openai_profiles(profiles)
+            index = self.base_url.findText(base_url)
+            if index >= 0:
+                active = next(
+                    profile for profile in self.openai_profiles if profile["base_url"] == base_url
+                )
+                self.base_url.setItemData(index, active)
+
+    def select_openai_profile(self, index: int) -> None:
+        if self.loading_provider or self.current_provider != "openai" or index < 0:
+            return
+        profile = self.base_url.itemData(index)
+        if not isinstance(profile, dict):
+            return
+        self.loading_provider = True
+        self.api_key.setText(profile["api_key"])
+        self.gemini_web2api.setChecked(profile["gemini_web2api"])
+        self.set_model_choices(profile["models"], profile["model"])
+        self.loading_provider = False
+        self.settings.setValue("openai/base_url", profile["base_url"])
+        self.settings.setValue("openai/model", profile["model"])
+        self.settings.setValue("openai/models", profile["models"])
+        self.settings.setValue("openai/key", protect_secret(profile["api_key"]))
+        self.settings.sync()
+        self.set_model_test_status("Chưa test model")
+        self.update_model_action()
+        self.update_openai_profile_actions()
+
+    def save_openai_profile(self) -> None:
+        base_url = self.base_url_text().rstrip("/")
+        model = self.model.currentText().strip()
+        try:
+            chat_endpoint(base_url)
+            if not model:
+                raise ValueError("Model không được để trống.")
+            models = list(dict.fromkeys(self.saved_models() + [model]))[:20]
+            profile = {
+                "base_url": base_url,
+                "model": model,
+                "models": models,
+                "api_key": self.api_key.text().strip(),
+                "gemini_web2api": self.gemini_web2api.isChecked(),
+            }
+            profiles = [
+                saved for saved in self.openai_profiles if saved["base_url"] != base_url
+            ] + [profile]
+            save_openai_profiles(self.settings, profiles)
+            self.settings.setValue("openai/base_url", base_url)
+            self.settings.setValue("openai/model", model)
+            self.settings.setValue("openai/models", models)
+            self.settings.setValue("openai/key", protect_secret(profile["api_key"]))
+            self.settings.sync()
+            self.refresh_openai_profiles(profiles, base_url)
+        except Exception as error:
+            QMessageBox.warning(self, "OpenAI-compatible profile", str(error))
+
+    def delete_openai_profile(self) -> None:
+        base_url = self.base_url_text().rstrip("/")
+        profiles = [
+            profile for profile in self.openai_profiles if profile["base_url"] != base_url
+        ]
+        if len(profiles) == len(self.openai_profiles):
+            return
+        model = self.model.currentText()
+        api_key = self.api_key.text()
+        save_openai_profiles(self.settings, profiles)
+        self.settings.sync()
+        self.refresh_openai_profiles(profiles, base_url)
+        self.model.setCurrentText(model)
+        self.api_key.setText(api_key)
+
     def load_provider_fields(self, provider: str) -> None:
         self.loading_provider = True
-        self.base_url.setText(self.settings.value("openai/base_url", "https://api.openai.com/v1", str))
-        self.model.clear()
+        current_url = self.settings.value(
+            "openai/base_url", "https://api.openai.com/v1", str
+        ).strip()
+        try:
+            profiles = load_openai_profiles(self.settings)
+        except Exception:
+            profiles = []
+        self.refresh_openai_profiles(profiles, current_url)
         model_history = self.settings.value(f"{provider}/models", [])
         if isinstance(model_history, str):
             model_history = [model_history]
         current_model = self.settings.value(
             f"{provider}/model", self.provider_default_model(provider), str
         ).strip()
-        models = list(
-            dict.fromkeys(
-                [str(item).strip() for item in model_history if str(item).strip()]
-                + ([current_model] if current_model else [])
+        if provider == "openai":
+            active_profile = next(
+                (profile for profile in profiles if profile["base_url"] == current_url.rstrip("/")),
+                None,
             )
-        )
-        self.model.addItems(models)
-        self.model.setCurrentText(current_model)
+            if active_profile is not None:
+                model_history = active_profile["models"]
+                current_model = active_profile["model"]
+                self.gemini_web2api.setChecked(active_profile["gemini_web2api"])
+            else:
+                self.gemini_web2api.setChecked(False)
+        self.set_model_choices(model_history, current_model)
         self.set_model_test_status("Chưa test model")
         self.api_key.clear()
         self.api_key.setPlaceholderText("")
@@ -1497,7 +1990,7 @@ class SettingsDialog(QDialog):
     def persist_provider_fields(self, provider: str, errors: list[str]) -> None:
         if provider == "openai":
             try:
-                base_url = self.base_url.text().strip()
+                base_url = self.base_url_text()
                 chat_endpoint(base_url)
                 self.settings.setValue("openai/base_url", base_url)
             except Exception as error:
@@ -1511,6 +2004,7 @@ class SettingsDialog(QDialog):
         try:
             if provider == "openai":
                 self.settings.setValue("openai/key", protect_secret(self.api_key.text().strip()))
+                self.sync_active_openai_profile_models()
             elif provider == "gemini":
                 save_gemini_keys(self.settings, self.gemini_keys())
                 self.settings.remove("gemini/key")
@@ -1530,10 +2024,15 @@ class SettingsDialog(QDialog):
 
     def update_provider_visibility(self) -> None:
         provider = self.current_provider
-        for widget in (self.base_url, self.form.labelForField(self.base_url)):
+        for widget in (self.base_url_row, self.form.labelForField(self.base_url_row)):
             if widget is not None:
                 widget.setVisible(provider == "openai")
-        for widget in (self.api_key, self.form.labelForField(self.api_key)):
+        for widget in (
+            self.api_key,
+            self.form.labelForField(self.api_key),
+            self.gemini_web2api,
+            self.form.labelForField(self.gemini_web2api),
+        ):
             if widget is not None:
                 widget.setVisible(provider == "openai")
         for widget in (self.gemini_key_tabs, self.form.labelForField(self.gemini_key_tabs)):
@@ -1618,6 +2117,7 @@ class SettingsDialog(QDialog):
         model = self.model.itemText(index).strip()
         if model:
             self.settings.setValue(f"{self.current_provider}/model", model)
+            self.sync_active_openai_profile_models()
             self.settings.sync()
         self.update_model_action()
 
@@ -1635,6 +2135,7 @@ class SettingsDialog(QDialog):
             self.model.setCurrentIndex(0)
         self.settings.setValue(f"{self.current_provider}/models", self.saved_models()[:20])
         self.settings.setValue(f"{self.current_provider}/model", self.model.currentText().strip())
+        self.sync_active_openai_profile_models()
         self.settings.sync()
         self.update_model_action()
 
@@ -1664,7 +2165,7 @@ class SettingsDialog(QDialog):
         try:
             if provider == "openai":
                 config = {
-                    "endpoint": chat_endpoint(self.base_url.text().strip()),
+                    "endpoint": chat_endpoint(self.base_url_text()),
                     "api_key": self.api_key.text().strip(),
                 }
             elif provider == "gemini":
@@ -1689,10 +2190,13 @@ class SettingsDialog(QDialog):
         self.test_worker.finished.connect(self.model_test_finished)
         self.set_model_test_status(f"Đang test {model}…")
         self.provider.setEnabled(False)
+        self.base_url.setEnabled(False)
+        self.api_key.setEnabled(False)
         self.model.setEnabled(False)
         self.model_test.setText("Hủy test")
         self.model_test.setEnabled(True)
         self.model_action.setEnabled(False)
+        self.update_openai_profile_actions()
         self.test_worker.start()
 
     def model_test_succeeded(self, _text: str) -> None:
@@ -1713,8 +2217,11 @@ class SettingsDialog(QDialog):
             self.test_worker.deleteLater()
         self.test_worker = None
         self.provider.setEnabled(True)
+        self.base_url.setEnabled(True)
+        self.api_key.setEnabled(True)
         self.model.setEnabled(True)
         self.update_model_action()
+        self.update_openai_profile_actions()
 
     def change_opacity(self, value: int) -> None:
         self.opacity_value.setText(f"{value}%")
@@ -1734,7 +2241,7 @@ class SettingsDialog(QDialog):
             f"""
             QWidget#settingsPanel {{ background: {solid_panel}; color: {text}; }}
             QWidget {{ color: {text}; font-family: "Segoe UI"; font-size: 14px; }}
-            QLineEdit, QPlainTextEdit, QComboBox, QKeySequenceEdit {{
+            QLineEdit, QPlainTextEdit, QComboBox {{
                 background: {field}; border: 1px solid {border}; border-radius: 7px; padding: 6px;
             }}
             QComboBox QAbstractItemView {{ background: {field}; color: {text}; selection-background-color: {border}; }}
@@ -1815,11 +2322,18 @@ class SettingsDialog(QDialog):
 
         try:
             hotkeys = []
+            identities = []
             for edit in self.hotkey_edits.values():
-                text = edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
-                hotkey_to_win(text)
+                text = edit.hotkeyText()
+                mouse_parts = mouse_hotkey_parts(text)
+                if mouse_parts is None:
+                    modifiers, virtual_key = hotkey_to_win(text, allow_repeat=True)
+                    identity = ("keyboard", modifiers, virtual_key)
+                else:
+                    identity = ("mouse", *mouse_parts)
                 hotkeys.append(text)
-            if len(set(hotkeys)) != len(hotkeys):
+                identities.append(identity)
+            if len(set(identities)) != len(identities):
                 raise ValueError("Các phím tắt không được trùng nhau.")
             for hotkey_id, text in zip(self.hotkey_edits, hotkeys):
                 self.settings.setValue(f"hotkeys/{hotkey_id}", text)
@@ -1964,6 +2478,8 @@ class OverlayWindow(QWidget):
         super().__init__(None, flags)
         self.settings = settings
         self.worker: ChatWorker | None = None
+        self.session_worker: ConversationCreateWorker | None = None
+        self.mouse_hotkey_hook: MouseHotkeyHook | None = None
         self.messages: list[dict] = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
         self.click_through = False
         self.exiting = False
@@ -2174,6 +2690,8 @@ class OverlayWindow(QWidget):
         if hasattr(self, "compact_settings_button"):
             self.compact_settings_button.move(self.width() - 34, 8)
             self.compact_settings_button.raise_()
+        if hasattr(self, "chat"):
+            QTimer.singleShot(0, self.update_chat_message_widths)
 
     def apply_size_settings(self, initial: bool = False, reset_to_default: bool = False) -> None:
         allow_tiny = self.settings.value("window/allow_tiny_resize", False, bool)
@@ -2243,6 +2761,12 @@ class OverlayWindow(QWidget):
         self.status.setText(f"Độ hiển thị: {min(100, max(5, percent))}%")
 
     def eventFilter(self, watched, event) -> bool:
+        if (
+            hasattr(self, "chat")
+            and watched is self.chat.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            QTimer.singleShot(0, self.update_chat_message_widths)
         if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
             self.drag_origin = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
@@ -2344,6 +2868,8 @@ class OverlayWindow(QWidget):
         self.apply_appearance_settings()
         self.setWindowOpacity(float(self.settings.value("window/opacity", self.windowOpacity())))
         self.hotkey_failures = register_hotkeys(self.settings)
+        if self.mouse_hotkey_hook is not None:
+            self.hotkey_failures.extend(self.mouse_hotkey_hook.update_bindings(self.settings))
         self.status.setText(
             ("Đã tự động lưu" if accepted else "Sẵn sàng")
             if not self.hotkey_failures
@@ -2351,6 +2877,15 @@ class OverlayWindow(QWidget):
         )
         self.settings_panel = None
         return True
+
+    def update_chat_message_widths(self) -> None:
+        viewport_width = self.chat.viewport().width()
+        for message in self.chat_content.findChildren(QLabel):
+            role = message.property("chatRole")
+            if role not in ("user", "assistant", "error"):
+                continue
+            ratio = 0.72 if role in ("user", "error") else 1.0
+            message.setMaximumWidth(max(80, int(viewport_width * ratio) - 20))
 
     def append_bubble(self, role: str, text: str, image: bytes | None = None) -> None:
         row = QWidget()
@@ -2361,16 +2896,22 @@ class OverlayWindow(QWidget):
         bubble.setObjectName(
             "userBubble" if role == "user" else "assistantMessage" if role == "assistant" else "errorBubble"
         )
-        bubble.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        bubble.setSizePolicy(
+            QSizePolicy.Policy.Expanding if role == "assistant" else QSizePolicy.Policy.Maximum,
+            QSizePolicy.Policy.Preferred,
+        )
         content_layout = QVBoxLayout(bubble)
         content_layout.setContentsMargins(10 if role != "assistant" else 2, 7, 10 if role != "assistant" else 2, 7)
         content_layout.setSpacing(5)
         message = QLabel(text if role != "error" else f"Lỗi\n{text}")
+        message.setProperty("chatRole", role)
         if role == "assistant":
             message.setTextFormat(Qt.TextFormat.MarkdownText)
+            message.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         message.setWordWrap(True)
         message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        message.setMaximumWidth(max(80, int(self.chat.viewport().width() * 0.72)))
+        ratio = 0.72 if role in ("user", "error") else 1.0
+        message.setMaximumWidth(max(80, int(self.chat.viewport().width() * ratio) - 20))
         content_layout.addWidget(message)
         if image:
             pixmap = QPixmap()
@@ -2388,6 +2929,8 @@ class OverlayWindow(QWidget):
         if role == "user":
             row_layout.addStretch(1)
             row_layout.addWidget(bubble)
+        elif role == "assistant":
+            row_layout.addWidget(bubble, 1)
         else:
             row_layout.addWidget(bubble)
             row_layout.addStretch(1)
@@ -2408,6 +2951,9 @@ class OverlayWindow(QWidget):
     def submit(self) -> None:
         if self.worker and self.worker.isRunning():
             self.status.setText("Đang chờ AI trả lời")
+            return
+        if self.session_worker is not None:
+            self.status.setText("Đang tạo session Gemini Web2API mới")
             return
         image = self.pending_image
         question = self.input.text().strip()
@@ -2559,6 +3105,61 @@ class OverlayWindow(QWidget):
         self.attachment_preview.clear()
         self.attachment.hide()
 
+    def reset_local_session(self) -> None:
+        self.messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
+        self.clear_pending_image()
+        while self.chat_layout.count() > 1:
+            item = self.chat_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.chat_layout.activate()
+        self.status.setText("Đã tạo session mới")
+
+    def new_session(self) -> None:
+        if self.worker and self.worker.isRunning():
+            self.status.setText("Đang chờ AI trả lời; chưa thể tạo session mới")
+            return
+        if self.session_worker is not None:
+            self.status.setText("Đang tạo session Gemini Web2API mới")
+            return
+        provider = self.settings.value("provider/current", "openai", str)
+        if provider != "openai":
+            self.reset_local_session()
+            return
+        base_url = self.settings.value("openai/base_url", "", str).strip().rstrip("/")
+        try:
+            profiles = load_openai_profiles(self.settings)
+            profile = next(
+                (profile for profile in profiles if profile["base_url"] == base_url),
+                None,
+            )
+            if profile is None or not profile["gemini_web2api"]:
+                self.reset_local_session()
+                return
+            endpoint = conversations_endpoint(base_url)
+            api_key = profile["api_key"]
+        except Exception as error:
+            self.status.setText("Không thể tạo session mới: " + str(error))
+            return
+        self.status.setText("Đang tạo session Gemini Web2API mới…")
+        self.session_worker = ConversationCreateWorker(endpoint, api_key)
+        self.session_worker.succeeded.connect(self.remote_session_created)
+        self.session_worker.failed.connect(self.remote_session_failed)
+        self.session_worker.finished.connect(self.remote_session_finished)
+        self.session_worker.start()
+
+    def remote_session_created(self) -> None:
+        self.reset_local_session()
+
+    def remote_session_failed(self, message: str) -> None:
+        self.status.setText("Không tạo được session mới: " + message)
+
+    def remote_session_finished(self) -> None:
+        if self.session_worker is not None:
+            self.session_worker.deleteLater()
+        self.session_worker = None
+
     def start_capture_from_hotkey(self) -> None:
         if self.settings_scroll.isVisible() and not self.close_settings(False):
             return
@@ -2576,6 +3177,7 @@ class OverlayWindow(QWidget):
             5: self.start_capture_from_hotkey,
             6: self.submit,
             7: self.open_settings,
+            8: self.new_session,
         }
         action = actions.get(hotkey_id)
         if action:
@@ -2594,6 +3196,8 @@ def register_hotkeys(settings: QSettings) -> list[str]:
     for hotkey_id, (label, _) in HOTKEYS.items():
         text = hotkey_text(settings, hotkey_id)
         try:
+            if mouse_hotkey_parts(text) is not None:
+                continue
             modifiers, virtual_key = hotkey_to_win(text, allow_repeat=hotkey_id in (3, 4))
             if not user32.RegisterHotKey(None, hotkey_id, modifiers, virtual_key):
                 failures.append(f"{label} ({text})")
@@ -2675,10 +3279,45 @@ def self_check() -> None:
         'data: {"type":"response.output_text.delta","delta":"lo"}\n\n'
     assert codex_sse_text(sse) == ("hello", True)
     assert codex_sse_text('{"output_text":"json fallback"}') == ("json fallback", False)
+    assert mouse_hotkey_parts("Mouse4") == (0, "Mouse4")
+    assert mouse_hotkey_parts("Ctrl+Mouse4") == (MOD_CONTROL, "Mouse4")
+    assert mouse_hotkey_parts("Alt+Shift+Mouse5") == (MOD_ALT | MOD_SHIFT, "Mouse5")
+    for invalid_mouse_hotkey in ("Ctrl+Ctrl+Mouse4", "Foo+Mouse5"):
+        try:
+            mouse_hotkey_parts(invalid_mouse_hotkey)
+            raise AssertionError(f"invalid mouse hotkey was accepted: {invalid_mouse_hotkey}")
+        except ValueError:
+            pass
     assert len(PROVIDER_MODELS["gemini"]) == 8 and PROVIDER_MODELS["gemini"][0] == "gemini-3.7-flash"
     assert "gemini-3.5-flash" in PROVIDER_MODELS["gemini"]
     assert not any(model.startswith("gemini-2.5-") for model in PROVIDER_MODELS["gemini"])
     assert normalize_gemini_keys([" key-1 ", "", "key-2", "key-1"]) == ["key-1", "key-2"]
+    assert conversations_endpoint("http://localhost:8081/v1/") == (
+        "http://localhost:8081/v1/conversations"
+    )
+    assert conversations_endpoint("http://localhost:8081/v1/chat/completions") == (
+        "http://localhost:8081/v1/conversations"
+    )
+    assert normalize_openai_profiles(
+        [
+            {"base_url": " https://one.test/v1/ ", "model": "model-one", "api_key": " key-one "},
+            {"base_url": "", "model": "invalid"},
+            {
+                "base_url": "https://one.test/v1",
+                "model": "model-two",
+                "api_key": "key-two",
+                "gemini_web2api": True,
+            },
+        ]
+    ) == [
+        {
+            "base_url": "https://one.test/v1",
+            "model": "model-two",
+            "models": ["model-two"],
+            "api_key": "key-two",
+            "gemini_web2api": True,
+        }
+    ]
     rotated = rotated_gemini_keys(["key-1", "key-2", "key-3"])
     assert len(rotated) == 3 and set(rotated) == {"key-1", "key-2", "key-3"}
     assert len(PROVIDER_MODELS["codex"]) == 12 and PROVIDER_MODELS["codex"][0] == "gpt-5.6-sol"
@@ -2688,6 +3327,9 @@ def self_check() -> None:
         test_settings.setValue("gemini/models", ["gemini-2.5-pro", "custom-model"])
         test_settings.setValue("gemini/model", "gemini-2.5-pro")
         test_settings.setValue("gemini/key", protect_secret("legacy-key"))
+        test_settings.setValue("openai/base_url", "https://legacy.test/v1")
+        test_settings.setValue("openai/model", "legacy-model")
+        test_settings.setValue("openai/key", protect_secret("legacy-openai-key"))
         migrate_provider_settings(test_settings)
         migrated_models = test_settings.value("gemini/models", [])
         assert "gemini-2.5-pro" not in migrated_models and "custom-model" in migrated_models
@@ -2695,6 +3337,15 @@ def self_check() -> None:
         assert test_settings.value("gemini/model", "", str) == "gemini-3.7-flash"
         assert load_gemini_keys(test_settings) == ["legacy-key"]
         assert not test_settings.contains("gemini/key")
+        assert load_openai_profiles(test_settings) == [
+            {
+                "base_url": "https://legacy.test/v1",
+                "model": "legacy-model",
+                "models": ["legacy-model"],
+                "api_key": "legacy-openai-key",
+                "gemini_web2api": False,
+            }
+        ]
     print("self-check: ok")
 
 
@@ -2717,9 +3368,13 @@ def main() -> int:
     window = OverlayWindow(settings)
     native_filter = HotkeyFilter(window.handle_hotkey)
     app.installNativeEventFilter(native_filter)
+    mouse_hook = MouseHotkeyHook(window.handle_hotkey)
+    window.mouse_hotkey_hook = mouse_hook
     failures = register_hotkeys(settings)
+    failures.extend(mouse_hook.update_bindings(settings))
     window.hotkey_failures = failures
     app.aboutToQuit.connect(unregister_hotkeys)
+    app.aboutToQuit.connect(mouse_hook.uninstall)
 
     screen = QApplication.primaryScreen().availableGeometry()
     window.move(screen.right() - window.width() - 28, screen.top() + 70)
