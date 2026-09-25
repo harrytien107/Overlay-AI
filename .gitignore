@@ -6,3 +6,6 @@ dist/
 *.spec
 .vscode/
 app_drm.py
+_smoke_attachment_ui.py
+_smoke_clipboard.py
+_smoke_pdf_rejection.py

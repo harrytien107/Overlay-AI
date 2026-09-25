@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import sys
+import subprocess
 import tempfile
 import threading
 import time
@@ -68,6 +69,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGraphicsOpacityEffect,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -1450,6 +1452,25 @@ def codex_app_turn_error(params: dict) -> str:
     return f"Codex App turn {turn.get('status', 'không rõ')}."
 
 
+def resolve_codex_executable(configured: str = "") -> str:
+    value = os.path.expandvars(configured.strip().strip('"'))
+    if value:
+        value = os.path.abspath(value)
+        if os.path.isdir(value):
+            for name in ("codex.exe", "codex.cmd", "codex.bat", "codex"):
+                candidate = os.path.join(value, name)
+                if os.path.isfile(candidate):
+                    return candidate
+            raise ValueError("Folder đã chọn không chứa codex.exe, codex.cmd hoặc codex.bat.")
+        if os.path.isfile(value):
+            return value
+        raise ValueError(f"Không tìm thấy Codex CLI tại: {value}")
+    executable = QStandardPaths.findExecutable("codex.exe") or QStandardPaths.findExecutable("codex")
+    if not executable:
+        raise ValueError("Không tìm thấy codex.exe trong PATH. Chọn đường dẫn Codex CLI hoặc cài Codex CLI.")
+    return executable
+
+
 class CodexAppClient(QObject):
     ready_changed = Signal(bool, str)
     models_changed = Signal(list)
@@ -1483,6 +1504,7 @@ class CodexAppClient(QObject):
         self.ready = False
         self.starting = False
         self.shutting_down = False
+        self.restarting = False
         self.thread_id = ""
         self.turn_id = ""
         self.response_parts: list[str] = []
@@ -1492,16 +1514,51 @@ class CodexAppClient(QObject):
     def start(self) -> None:
         if self.ready or self.starting or self.process.state() != QProcess.ProcessState.NotRunning:
             return
-        executable = self.executable or (
-            QStandardPaths.findExecutable("codex.exe") or QStandardPaths.findExecutable("codex")
-        )
-        if not executable:
-            self.ready_changed.emit(False, "Không tìm thấy codex.exe trong PATH. Cài Codex CLI rồi chạy: codex login")
+        try:
+            executable = resolve_codex_executable(self.executable)
+        except ValueError as error:
+            self.ready_changed.emit(False, str(error))
             return
         self.starting = True
-        self.process.setProgram(executable)
-        self.process.setArguments(self.arguments if self.arguments is not None else ["app-server"])
+        arguments = self.arguments if self.arguments is not None else ["app-server"]
+        if os.path.splitext(executable)[1].lower() in (".cmd", ".bat"):
+            command = subprocess.list2cmdline([executable, *arguments])
+            self.process.setProgram(os.environ.get("COMSPEC", "cmd.exe"))
+            self.process.setArguments(["/d", "/s", "/c", command])
+        else:
+            self.process.setProgram(executable)
+            self.process.setArguments(arguments)
         self.process.start()
+
+    def configure_executable(self, executable: str) -> None:
+        executable = executable.strip().strip('"')
+        if executable == self.executable:
+            return
+        if self.busy:
+            raise RuntimeError("Codex App đang trả lời; chưa thể đổi đường dẫn CLI.")
+        if executable:
+            resolve_codex_executable(executable)
+        self.executable = executable
+        self.ready = False
+        self.starting = False
+        self.callbacks.clear()
+        self.reset_thread()
+        self.buffer.clear()
+        self.stderr_buffer.clear()
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            self.start()
+            return
+        self.restarting = True
+        self.process.closeWriteChannel()
+        self.process.terminate()
+        if not self.process.waitForFinished(1200):
+            self.process.kill()
+            self.process.waitForFinished(800)
+        QTimer.singleShot(0, self._restart_after_stop)
+
+    def _restart_after_stop(self) -> None:
+        self.restarting = False
+        self.start()
 
     def _write(self, payload: dict) -> None:
         if self.process.state() != QProcess.ProcessState.Running:
@@ -1775,7 +1832,7 @@ class CodexAppClient(QObject):
         self._process_failed(detail or "codex app-server đã dừng.")
 
     def _process_failed(self, message: str) -> None:
-        if self.shutting_down:
+        if self.shutting_down or self.restarting:
             return
         was_busy = self.busy
         self.ready = False
@@ -1817,7 +1874,22 @@ class AttachmentLoader(QThread):
                 mime_type = mime_database.mimeTypeForFile(
                     path, QMimeDatabase.MatchMode.MatchContent
                 ).name()
+                if mime_type == "application/pdf" or raw.startswith(b"%PDF-"):
+                    LOGGER.info(
+                        "attachment rejected name=%s mime=%s bytes=%d reason=unsupported_pdf",
+                        os.path.basename(path),
+                        mime_type,
+                        len(raw),
+                    )
+                    raise ValueError("File PDF chưa được hỗ trợ.")
                 image = QImage.fromData(raw)
+                LOGGER.info(
+                    "attachment classified name=%s mime=%s bytes=%d image_decoder=%s",
+                    os.path.basename(path),
+                    mime_type,
+                    len(raw),
+                    not image.isNull(),
+                )
                 if not image.isNull():
                     attachments.append(
                         {
@@ -1845,8 +1917,34 @@ class AttachmentLoader(QThread):
 
 class SubmitLineEdit(QLineEdit):
     submitted = Signal()
+    image_pasted = Signal(bytes)
+    files_pasted = Signal(list)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.matches(QKeySequence.StandardKey.Paste):
+            mime_data = QApplication.clipboard().mimeData()
+            if mime_data.hasImage():
+                image_data = mime_data.imageData()
+                image = image_data.toImage() if isinstance(image_data, QPixmap) else image_data
+                if isinstance(image, QImage) and not image.isNull():
+                    data = QByteArray()
+                    buffer = QBuffer(data)
+                    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+                    if image.save(buffer, "PNG"):
+                        self.image_pasted.emit(bytes(data))
+                        event.accept()
+                        return
+            paths = [url.toLocalFile() for url in mime_data.urls() if url.isLocalFile()]
+            if not paths and mime_data.hasText():
+                for line in mime_data.text().splitlines():
+                    url = QUrl(line.strip())
+                    if url.isLocalFile():
+                        paths.append(url.toLocalFile())
+            paths = [path for path in paths if path and os.path.isfile(path)]
+            if paths:
+                self.files_pasted.emit(paths)
+                event.accept()
+                return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.submitted.emit()
             event.accept()
@@ -2048,6 +2146,17 @@ class SettingsDialog(QDialog):
             add_index, QTabBar.ButtonPosition.LeftSide, None
         )
         self.add_gemini_key_tab()
+        self.codex_cli_path = QLineEdit(settings.value("codex_app/executable", "", str))
+        self.codex_cli_path.setClearButtonEnabled(True)
+        self.codex_cli_path.setPlaceholderText("Để trống để tự tìm codex.exe trong PATH")
+        self.codex_cli_browse = QPushButton("Chọn…")
+        self.codex_cli_browse.clicked.connect(self.choose_codex_cli)
+        self.codex_cli_row = QWidget()
+        codex_cli_layout = QHBoxLayout(self.codex_cli_row)
+        codex_cli_layout.setContentsMargins(0, 0, 0, 0)
+        codex_cli_layout.setSpacing(6)
+        codex_cli_layout.addWidget(self.codex_cli_path, 1)
+        codex_cli_layout.addWidget(self.codex_cli_browse)
         self.codex_status = QLabel()
         self.codex_status.setWordWrap(True)
         self.codex_action = QPushButton("Đăng nhập")
@@ -2137,6 +2246,7 @@ class SettingsDialog(QDialog):
         self.form.addRow("API key", self.api_key)
         self.form.addRow("", self.gemini_web2api)
         self.form.addRow("Gemini API keys", self.gemini_key_tabs)
+        self.form.addRow("Đường dẫn Codex CLI", self.codex_cli_row)
         self.form.addRow("Tài khoản Codex", self.codex_status)
         self.form.addRow("", self.codex_action)
         self.form.addRow("Prompt khi gửi ảnh", self.image_prompt)
@@ -2199,6 +2309,7 @@ class SettingsDialog(QDialog):
         self.gemini_web2api.toggled.connect(self.schedule_auto_save)
         self.provider.currentIndexChanged.connect(self.change_provider)
         self.model.editTextChanged.connect(self.schedule_auto_save)
+        self.codex_cli_path.editingFinished.connect(self.schedule_auto_save)
         self.image_prompt.textChanged.connect(self.schedule_auto_save)
         for checkbox in (
             self.always_on_top,
@@ -2485,6 +2596,7 @@ class SettingsDialog(QDialog):
                 edit = self.gemini_key_tabs.widget(0).findChild(QLineEdit)
                 if edit is not None:
                     edit.setPlaceholderText("Không đọc được danh sách key; nhập lại")
+        self.codex_cli_path.setText(self.settings.value("codex_app/executable", "", str))
         self.loading_provider = False
         self.update_model_action()
         self.update_codex_status()
@@ -2515,6 +2627,15 @@ class SettingsDialog(QDialog):
             elif provider == "gemini":
                 save_gemini_keys(self.settings, self.gemini_keys())
                 self.settings.remove("gemini/key")
+            elif provider == "codex_app":
+                executable = self.codex_cli_path.text().strip().strip('"')
+                if executable:
+                    resolve_codex_executable(executable)
+                    executable = os.path.normpath(os.path.abspath(os.path.expandvars(executable)))
+                previous = self.settings.value("codex_app/executable", "", str)
+                self.settings.setValue("codex_app/executable", executable)
+                if self.overlay is not None and executable != previous:
+                    self.overlay.codex_app.configure_executable(executable)
         except Exception as error:
             errors.append(str(error))
 
@@ -2545,6 +2666,9 @@ class SettingsDialog(QDialog):
         for widget in (self.gemini_key_tabs, self.form.labelForField(self.gemini_key_tabs)):
             if widget is not None:
                 widget.setVisible(provider == "gemini")
+        for widget in (self.codex_cli_row, self.form.labelForField(self.codex_cli_row)):
+            if widget is not None:
+                widget.setVisible(provider == "codex_app")
         for widget in (
             self.codex_status,
             self.form.labelForField(self.codex_status),
@@ -2812,6 +2936,20 @@ class SettingsDialog(QDialog):
         if not self.loading_provider:
             self.autosave_timer.start()
 
+    def choose_codex_cli(self) -> None:
+        start = self.codex_cli_path.text().strip()
+        if not os.path.exists(start):
+            start = os.path.expandvars("%LOCALAPPDATA%")
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Chọn Codex CLI",
+            start,
+            "Codex CLI (codex.exe codex.cmd codex.bat);;Tất cả file (*)",
+        )
+        if path:
+            self.codex_cli_path.setText(os.path.normpath(path))
+            self.save_settings(True)
+
     def choose_image_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(
             self,
@@ -3029,7 +3167,10 @@ class OverlayWindow(QWidget):
         self.settings = settings
         self.worker: ChatWorker | None = None
         self.session_worker: ConversationCreateWorker | None = None
-        self.codex_app = CodexAppClient(self)
+        self.codex_app = CodexAppClient(
+            self,
+            executable=settings.value("codex_app/executable", "", str),
+        )
         self.codex_app.succeeded.connect(self.on_chat_success)
         self.codex_app.failed.connect(self.on_chat_error)
         self.codex_app.delta.connect(self.on_codex_delta)
@@ -3042,6 +3183,7 @@ class OverlayWindow(QWidget):
         self.was_visible_before_capture = True
         self.selector: SelectionOverlay | None = None
         self.pending_attachments: list[dict] = []
+        self.attachment_columns = 0
         self.attachment_loader: AttachmentLoader | None = None
         self.active_submission: dict | None = None
         self.hotkey_failures: list[str] = []
@@ -3116,9 +3258,10 @@ class OverlayWindow(QWidget):
 
         self.attachment = QFrame()
         self.attachment.setObjectName("attachment")
-        self.attachment_layout = QVBoxLayout(self.attachment)
+        self.attachment_layout = QGridLayout(self.attachment)
         self.attachment_layout.setContentsMargins(8, 6, 8, 6)
         self.attachment_layout.setSpacing(4)
+        self.attachment_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.attachment.hide()
         layout.addWidget(self.attachment)
 
@@ -3138,6 +3281,8 @@ class OverlayWindow(QWidget):
         self.input.setPlaceholderText("Bạn cần giúp gì?")
         self.input.setFixedHeight(34)
         self.input.submitted.connect(self.submit)
+        self.input.image_pasted.connect(self.paste_clipboard_image)
+        self.input.files_pasted.connect(self.load_attachment_paths)
         send_button = QPushButton("➤")
         send_button.setObjectName("sendButton")
         send_button.setToolTip("Gửi • Ctrl+Enter")
@@ -3246,6 +3391,8 @@ class OverlayWindow(QWidget):
             self.compact_settings_button.raise_()
         if hasattr(self, "chat"):
             QTimer.singleShot(0, self.update_chat_message_widths)
+        if hasattr(self, "attachment") and self.pending_attachments:
+            QTimer.singleShot(0, self.reflow_attachment_ui)
 
     def apply_size_settings(self, initial: bool = False, reset_to_default: bool = False) -> None:
         allow_tiny = self.settings.value("window/allow_tiny_resize", False, bool)
@@ -3358,6 +3505,9 @@ class OverlayWindow(QWidget):
             #inputFrame {{ background: {field}; border: 1px solid {border}; border-radius: 22px; }}
             #input {{ background: transparent; border: none; padding: 0px; }}
             #attachment {{ background: {field}; border: 1px solid #2388b7; border-radius: 9px; }}
+            #attachmentThumbnail {{ background: transparent; border: 1px solid {border}; border-radius: 7px; }}
+            #attachmentRemove {{ background: rgba(0, 0, 0, 170); color: white; border: none; border-radius: 10px; padding: 0px; font-size: 15px; }}
+            #attachmentRemove:hover {{ background: #b83b4b; }}
             #userBubble {{ background: {user_bubble}; border-radius: 12px; }}
             #assistantMessage {{ background: transparent; border: none; }}
             #errorBubble {{ background: #5a2730; border-radius: 10px; }}
@@ -3712,22 +3862,37 @@ class OverlayWindow(QWidget):
         self.status.setText("Ảnh đã đính kèm • Ctrl+Enter để gửi")
 
     def choose_attachments(self) -> None:
-        if self.attachment_loader is not None:
-            self.status.setText("Đang đọc file đã chọn")
-            return
         paths, _filter = QFileDialog.getOpenFileNames(
             self,
             "Ghim ảnh hoặc file text/code",
             "",
             "Ảnh và text/code (*);;Tất cả file (*)",
         )
-        if not paths:
+        if paths:
+            self.load_attachment_paths(paths)
+
+    def load_attachment_paths(self, paths: list[str]) -> None:
+        if self.attachment_loader is not None:
+            self.status.setText("Đang đọc file đã chọn")
             return
         self.attachment_loader = AttachmentLoader(paths)
         self.attachment_loader.loaded.connect(self.attachments_loaded)
         self.attachment_loader.finished.connect(self.attachment_loader_finished)
         self.status.setText(f"Đang đọc {len(paths)} file…")
         self.attachment_loader.start()
+
+    def paste_clipboard_image(self, data: bytes) -> None:
+        self.pending_attachments.append(
+            {
+                "kind": "image",
+                "name": "Ảnh clipboard.png",
+                "mime_type": "image/png",
+                "data": data,
+                "source_path": "",
+            }
+        )
+        self.refresh_attachment_ui()
+        self.status.setText("Ảnh clipboard đã được đính kèm • Ctrl+Enter để gửi")
 
     def attachments_loaded(self, attachments: list, errors: list) -> None:
         self.pending_attachments.extend(attachments)
@@ -3741,43 +3906,77 @@ class OverlayWindow(QWidget):
             self.attachment_loader.deleteLater()
         self.attachment_loader = None
 
+    def attachment_column_count(self) -> int:
+        available = max(76, self.attachment.width() - 16)
+        return max(1, (available + 4) // 80)
+
+    def reflow_attachment_ui(self) -> None:
+        if self.attachment_column_count() != self.attachment_columns:
+            self.refresh_attachment_ui()
+
     def refresh_attachment_ui(self) -> None:
         while self.attachment_layout.count():
-            item = self.attachment_layout.takeAt(0)
-            widget = item.widget()
+            layout_item = self.attachment_layout.takeAt(0)
+            widget = layout_item.widget()
             if widget is not None:
                 widget.deleteLater()
+        columns = self.attachment_column_count()
+        self.attachment_columns = columns
+        grid_row = 0
+        grid_column = 0
         for index, item in enumerate(self.pending_attachments):
-            row = QWidget()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
             if item.get("kind") == "image":
-                preview = QLabel()
-                preview.setFixedSize(48, 32)
+                tile = QFrame()
+                tile.setFixedSize(76, 58)
+                tile.setToolTip(str(item.get("source_path") or item.get("name", "Ảnh")))
+                preview = QLabel(tile)
+                preview.setObjectName("attachmentThumbnail")
+                preview.setFixedSize(tile.size())
+                preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 pixmap = QPixmap()
                 pixmap.loadFromData(item["data"])
                 preview.setPixmap(
                     pixmap.scaled(
-                        preview.size(),
+                        preview.size() - QSize(2, 2),
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation,
                     )
                 )
-                row_layout.addWidget(preview)
-            else:
-                icon = QLabel("📄")
-                icon.setFixedWidth(28)
-                row_layout.addWidget(icon)
+                remove = QPushButton("×", tile)
+                remove.setObjectName("attachmentRemove")
+                remove.setFixedSize(20, 20)
+                remove.move(tile.width() - 22, 2)
+                remove.clicked.connect(lambda _checked=False, i=index: self.remove_attachment(i))
+                remove.raise_()
+                self.attachment_layout.addWidget(tile, grid_row, grid_column)
+                grid_column += 1
+                if grid_column == columns:
+                    grid_row += 1
+                    grid_column = 0
+                continue
+
+            if grid_column:
+                grid_row += 1
+                grid_column = 0
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            icon = QLabel("📄")
+            icon.setFixedWidth(28)
             label = QLabel(str(item.get("name", "file")))
             label.setToolTip(str(item.get("source_path", "")))
             remove = QPushButton("×")
             remove.setObjectName("iconButton")
             remove.setFixedSize(30, 30)
             remove.clicked.connect(lambda _checked=False, i=index: self.remove_attachment(i))
+            row_layout.addWidget(icon)
             row_layout.addWidget(label, 1)
             row_layout.addWidget(remove)
-            self.attachment_layout.addWidget(row)
+            self.attachment_layout.addWidget(row, grid_row, 0, 1, columns)
+            grid_row += 1
         self.attachment.setVisible(bool(self.pending_attachments))
+        if self.pending_attachments:
+            QTimer.singleShot(0, self.reflow_attachment_ui)
 
     def remove_attachment(self, index: int) -> None:
         if 0 <= index < len(self.pending_attachments):
@@ -4001,6 +4200,12 @@ def self_check() -> None:
     assert codex_app_thread_id({"thread": {"id": "thread-1"}}) == "thread-1"
     assert codex_app_thread_id({"thread": {"sessionId": "session-1"}}) == "session-1"
     assert codex_app_turn_error({"turn": {"error": {"message": "failed"}}}) == "failed"
+    with tempfile.TemporaryDirectory() as folder:
+        fake_codex = os.path.join(folder, "codex.exe")
+        with open(fake_codex, "wb"):
+            pass
+        assert resolve_codex_executable(folder) == fake_codex
+        assert resolve_codex_executable(fake_codex) == fake_codex
     assert gemini_text({"candidates": [{"content": {"parts": [{"text": "gemini"}]}}]}) == "gemini"
     sse = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hel"}\n\n' \
         'data: {"type":"response.output_text.delta","delta":"lo"}\n\n'
