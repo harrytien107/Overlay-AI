@@ -8,4 +8,5 @@ dist/
 app_drm.py
 _smoke_attachment_ui.py
 _smoke_clipboard.py
-_smoke_pdf_rejection.py
+_smoke_codex_protocol.py
+_smoke_pdf_hybrid.py

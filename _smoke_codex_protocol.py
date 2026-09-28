@@ -32,6 +32,16 @@ def run_server() -> int:
             emit(sys.stdout, {"id": request_id, "result": {"thread": {"id": f"thread-{turns + 1}"}}})
         elif method == "turn/start":
             turns += 1
+            if turns == 1:
+                input_items = message.get("params", {}).get("input", [])
+                if [item.get("type") for item in input_items] != ["text", "text", "text", "localImage"]:
+                    return 22
+                if "document.pdf — trang 1" not in input_items[1].get("text", ""):
+                    return 23
+                if "document.pdf — trang 2" not in input_items[2].get("text", ""):
+                    return 24
+                if not os.path.isfile(input_items[3].get("path", "")):
+                    return 25
             emit(sys.stdout, {"id": request_id, "result": {"turn": {"id": f"turn-{turns}"}}})
             if turns == 1:
                 waiting_for = "command"
@@ -109,7 +119,21 @@ def run_smoke() -> int:
     def maybe_start() -> None:
         if state["phase"] == 0 and state["models"] and state["account"]:
             state["phase"] = 1
-            client.send_message("fake-model", "first", [], "inspect")
+            client.send_message(
+                "fake-model",
+                "first",
+                [
+                    {
+                        "kind": "pdf",
+                        "name": "document.pdf",
+                        "pages": [
+                            {"page": 1, "kind": "text", "text": "PDF text"},
+                            {"page": 2, "kind": "image", "data": b"synthetic-png"},
+                        ],
+                    }
+                ],
+                "inspect",
+            )
 
     def succeeded(text: str) -> None:
         if state["phase"] == 1 and text == "hello":

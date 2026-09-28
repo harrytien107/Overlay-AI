@@ -60,6 +60,7 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
 )
+from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -755,30 +756,68 @@ def text_attachment_block(name: str, text: str) -> str:
     return f"[Tệp: {name}]\n----- BEGIN FILE -----\n{text}\n----- END FILE -----"
 
 
+def attachment_segments(attachments: list[dict]) -> list[dict]:
+    segments = []
+    for item in attachments:
+        if item.get("kind") != "pdf":
+            segments.append(item)
+            continue
+        name = str(item.get("name", "file.pdf"))
+        for page in item.get("pages", []):
+            page_number = int(page.get("page", 0))
+            if page.get("kind") == "text":
+                segments.append(
+                    {
+                        "kind": "text",
+                        "name": f"{name} — trang {page_number}",
+                        "text": str(page.get("text", "")),
+                    }
+                )
+            elif page.get("kind") == "image":
+                segments.append(
+                    {
+                        "kind": "text",
+                        "name": f"{name} — trang {page_number}",
+                        "text": "Trang PDF không có text trích xuất; ảnh render của trang nằm ngay bên dưới.",
+                    }
+                )
+                segments.append(
+                    {
+                        "kind": "image",
+                        "name": f"{name} — trang {page_number}.png",
+                        "mime_type": "image/png",
+                        "data": page["data"],
+                    }
+                )
+    return segments
+
+
 def attachment_prompt(question: str, attachments: list[dict], image_prompt: str) -> str:
+    segments = attachment_segments(attachments)
     parts = []
-    if any(item.get("kind") == "image" for item in attachments) and image_prompt.strip():
+    if any(item.get("kind") == "image" for item in segments) and image_prompt.strip():
         parts.append(image_prompt.strip())
     if question.strip():
         parts.append(question.strip())
     parts.extend(
         text_attachment_block(str(item.get("name", "file")), str(item.get("text", "")))
-        for item in attachments
+        for item in segments
         if item.get("kind") == "text"
     )
     return "\n\n".join(parts) or "Hãy phân tích tệp đính kèm."
 
 
 def attachment_content(question: str, attachments: list[dict], image_prompt: str) -> list[dict]:
+    segments = attachment_segments(attachments)
     intro = []
-    if any(item.get("kind") == "image" for item in attachments) and image_prompt.strip():
+    if any(item.get("kind") == "image" for item in segments) and image_prompt.strip():
         intro.append(image_prompt.strip())
     if question.strip():
         intro.append(question.strip())
     content = []
     if intro:
         content.append({"type": "text", "text": "\n\n".join(intro)})
-    for item in attachments:
+    for item in segments:
         if item.get("kind") == "text":
             content.append(
                 {
@@ -1676,13 +1715,14 @@ class CodexAppClient(QObject):
             self._turn_failed("Thiếu dữ liệu turn Codex App.")
             return
         model, question, attachments, image_prompt = self.pending_turn
+        segments = attachment_segments(attachments)
         intro = []
-        if any(item.get("kind") == "image" for item in attachments) and image_prompt.strip():
+        if any(item.get("kind") == "image" for item in segments) and image_prompt.strip():
             intro.append(image_prompt.strip())
         if question.strip():
             intro.append(question.strip())
         input_items = [{"type": "text", "text": "\n\n".join(intro)}] if intro else []
-        for index, item in enumerate(attachments):
+        for index, item in enumerate(segments):
             if item.get("kind") == "text":
                 input_items.append(
                     {
@@ -1856,6 +1896,45 @@ class CodexAppClient(QObject):
         self.temp_dir.cleanup()
 
 
+def pdf_attachment(path: str, size: int) -> dict:
+    document = QPdfDocument()
+    try:
+        error = document.load(path)
+        if error == QPdfDocument.Error.IncorrectPassword:
+            raise ValueError("PDF có mật khẩu chưa được hỗ trợ.")
+        if error != QPdfDocument.Error.None_ or document.status() != QPdfDocument.Status.Ready:
+            raise ValueError("Không thể đọc file PDF hoặc định dạng PDF không hợp lệ.")
+        page_count = document.pageCount()
+        if page_count < 1:
+            raise ValueError("File PDF không có trang.")
+        pages = []
+        for page_index in range(page_count):
+            text = document.getAllText(page_index).text().strip()
+            if text:
+                pages.append({"page": page_index + 1, "kind": "text", "text": text})
+                continue
+            points = document.pagePointSize(page_index)
+            image_size = QSize(max(1, round(points.width() * 2)), max(1, round(points.height() * 2)))
+            image = document.render(page_index, image_size)
+            if image.isNull():
+                raise ValueError(f"Không thể render trang PDF {page_index + 1}.")
+            data = QByteArray()
+            buffer = QBuffer(data)
+            if not buffer.open(QIODevice.OpenModeFlag.WriteOnly) or not image.save(buffer, "PNG"):
+                raise ValueError(f"Không thể mã hóa trang PDF {page_index + 1} thành PNG.")
+            pages.append({"page": page_index + 1, "kind": "image", "data": bytes(data)})
+        return {
+            "kind": "pdf",
+            "name": os.path.basename(path),
+            "pages": pages,
+            "page_count": page_count,
+            "size": size,
+            "source_path": path,
+        }
+    finally:
+        document.close()
+
+
 class AttachmentLoader(QThread):
     loaded = Signal(list, list)
 
@@ -1875,13 +1954,18 @@ class AttachmentLoader(QThread):
                     path, QMimeDatabase.MatchMode.MatchContent
                 ).name()
                 if mime_type == "application/pdf" or raw.startswith(b"%PDF-"):
+                    attachment = pdf_attachment(path, len(raw))
+                    attachments.append(attachment)
+                    text_pages = sum(page.get("kind") == "text" for page in attachment["pages"])
                     LOGGER.info(
-                        "attachment rejected name=%s mime=%s bytes=%d reason=unsupported_pdf",
+                        "attachment classified name=%s mime=application/pdf bytes=%d pages=%d text_pages=%d image_pages=%d",
                         os.path.basename(path),
-                        mime_type,
                         len(raw),
+                        attachment["page_count"],
+                        text_pages,
+                        attachment["page_count"] - text_pages,
                     )
-                    raise ValueError("File PDF chưa được hỗ trợ.")
+                    continue
                 image = QImage.fromData(raw)
                 LOGGER.info(
                     "attachment classified name=%s mime=%s bytes=%d image_decoder=%s",
@@ -3589,7 +3673,27 @@ class OverlayWindow(QWidget):
             if role not in ("user", "assistant", "error"):
                 continue
             ratio = 0.72 if role in ("user", "error") else 1.0
-            message.setMaximumWidth(max(80, int(viewport_width * ratio) - 20))
+            maximum_width = max(80, int(viewport_width * ratio) - 20)
+            message.setMaximumWidth(maximum_width)
+            message.updateGeometry()
+            bubble = message.parentWidget()
+            if bubble is None:
+                continue
+            for attachment_label in bubble.findChildren(QLabel):
+                if attachment_label.property("chatAttachment"):
+                    attachment_label.setMaximumWidth(maximum_width)
+                    attachment_label.updateGeometry()
+            if bubble.layout() is not None:
+                bubble.layout().invalidate()
+            bubble.updateGeometry()
+            row = bubble.parentWidget()
+            if row is not None:
+                if row.layout() is not None:
+                    row.layout().invalidate()
+                row.updateGeometry()
+        self.chat_layout.invalidate()
+        self.chat_layout.activate()
+        self.chat_content.updateGeometry()
 
     def append_bubble(self, role: str, text: str, attachments: list[dict] | None = None) -> QWidget:
         row = QWidget()
@@ -3600,6 +3704,7 @@ class OverlayWindow(QWidget):
         bubble.setObjectName(
             "userBubble" if role == "user" else "assistantMessage" if role == "assistant" else "errorBubble"
         )
+        bubble.setMinimumWidth(0)
         bubble.setSizePolicy(
             QSizePolicy.Policy.Expanding if role == "assistant" else QSizePolicy.Policy.Maximum,
             QSizePolicy.Policy.Preferred,
@@ -3609,9 +3714,13 @@ class OverlayWindow(QWidget):
         content_layout.setSpacing(5)
         message = QLabel(text if role != "error" else f"Lỗi\n{text}")
         message.setProperty("chatRole", role)
+        message.setMinimumWidth(0)
+        message.setSizePolicy(
+            QSizePolicy.Policy.Expanding if role == "assistant" else QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
         if role == "assistant":
             message.setTextFormat(Qt.TextFormat.MarkdownText)
-            message.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         message.setWordWrap(True)
         message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         ratio = 0.72 if role in ("user", "error") else 1.0
@@ -3634,6 +3743,11 @@ class OverlayWindow(QWidget):
                 content_layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignLeft)
             else:
                 file_label = QLabel("📄 " + str(attachment.get("name", "file")))
+                file_label.setProperty("chatAttachment", True)
+                file_label.setMinimumWidth(0)
+                file_label.setMaximumWidth(message.maximumWidth())
+                file_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+                file_label.setWordWrap(True)
                 file_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
                 content_layout.addWidget(file_label)
         if role == "user":
@@ -4194,6 +4308,22 @@ def self_check() -> None:
     assert [part["type"] for part in ordered] == ["text", "image_url", "text", "image_url"]
     assert ordered[1]["image_url"]["url"].endswith("YQ==")
     assert ordered[3]["image_url"]["url"].endswith("Yg==")
+    pdf_segments = attachment_segments(
+        [
+            {
+                "kind": "pdf",
+                "name": "document.pdf",
+                "pages": [
+                    {"page": 1, "kind": "text", "text": "page text"},
+                    {"page": 2, "kind": "image", "data": b"png"},
+                ],
+            }
+        ]
+    )
+    assert [item["kind"] for item in pdf_segments] == ["text", "text", "image"]
+    assert pdf_segments[0]["name"] == "document.pdf — trang 1"
+    assert pdf_segments[1]["name"] == "document.pdf — trang 2"
+    assert pdf_segments[2]["data"] == b"png"
     assert codex_app_models(
         {"data": [{"model": "one"}, {"id": "two"}, {"model": "one"}, {"model": "hidden", "hidden": True}]}
     ) == ["one", "two"]

@@ -1,6 +1,6 @@
 # Overlay AI cho Windows
 
-Ứng dụng overlay desktop viết bằng Python/PySide6, hỗ trợ chat văn bản, ảnh và file text/code qua OpenAI-compatible, Gemini API, Codex OAuth thử nghiệm và Codex App/CLI cục bộ.
+Ứng dụng overlay desktop viết bằng Python/PySide6, hỗ trợ chat văn bản, ảnh, PDF và file text/code qua OpenAI-compatible, Gemini API, Codex OAuth thử nghiệm và Codex App/CLI cục bộ.
 
 > **Tuyên bố sử dụng:** Dự án chỉ phục vụ mục đích học tập. Không được sử dụng trong bất kỳ trường hợp gian lận nào, bao gồm thi cử, kiểm tra và đánh giá.
 
@@ -10,7 +10,7 @@
 - Resize từ bốn cạnh/bốn góc, điều chỉnh opacity từ `5%` đến `100%` và ba theme Đen/Xám/Trắng. Thanh trượt, phím tắt và popup dropdown trong Cài đặt dùng chung opacity theo thời gian thực.
 - Cài đặt nằm trong overlay, responsive và tự động lưu.
 - Chụp vùng trên nhiều màn hình; ảnh được thêm vào cùng danh sách attachment trước khi gửi và có thể lưu bản sao vào folder đã chọn. `Ctrl+E` trong Cài đặt tự lưu, chuyển về Chat rồi mở vùng chụp.
-- Nút ghim hỗ trợ chọn cùng lúc nhiều ảnh và file text/code. `Ctrl+V` trong ô chat nhận cả bitmap clipboard từ Snipping Tool và local file URL như `file:///...png` thành attachment thay vì dán URI thành chữ; clipboard text thường vẫn được dán vào ô nhập. File được đọc ngoài UI thread; ảnh hiện thành các thumbnail ngang tự xuống hàng, file text/code giữ tên và mọi attachment có thể xóa riêng.
+- Nút ghim hỗ trợ chọn cùng lúc nhiều ảnh, PDF và file text/code. `Ctrl+V` trong ô chat nhận cả bitmap clipboard từ Snipping Tool và local file URL như `file:///...png` thành attachment thay vì dán URI thành chữ; clipboard text thường vẫn được dán vào ô nhập. File được đọc ngoài UI thread; ảnh hiện thành các thumbnail ngang tự xuống hàng, PDF/file text/code giữ tên và mọi attachment có thể xóa riêng.
 - Chat văn bản/attachment qua OpenAI-compatible, Gemini API, Codex OAuth thử nghiệm hoặc tài khoản Codex CLI/Codex App đã đăng nhập.
 - Render câu trả lời bằng Markdown và tự cuộn nội dung. Câu trả lời AI giãn theo gần toàn bộ chiều rộng khung chat; bubble người dùng giữ tối đa `72%`.
 - Tạo session mới bằng `Ctrl+N`: xóa lịch sử chat và attachment chờ, giữ nội dung đang gõ; thao tác bị chặn khi AI đang trả lời. Với Codex App/CLI, phím này bỏ thread hiện tại nhưng giữ process app-server. Profile Gemini Web2API có thể tạo conversation mới trên server trước khi reset cục bộ.
@@ -36,7 +36,8 @@ Trong Cài đặt, chọn provider rồi cấu hình:
 - Nút **Test** gửi prompt tối thiểu qua model đang chọn và hiển thị kết quả trong Cài đặt; request này không được thêm vào lịch sử chat. Trong khi request chạy, nút đổi thành **Hủy test**. Với Codex App/CLI, nút này làm mới catalog thay vì tạo turn tính quota.
 - **Folder lưu ảnh đã gửi** cho phép chọn bằng nút icon folder, mở và bật/tắt lưu bằng công tắc có animation. Toàn bộ công tắc nhận click. Tắt lưu vẫn giữ folder để bật lại nhanh. Chỉ ảnh thực sự được gửi mới được sao chép; lỗi ghi file không chặn request chat.
 - Prompt dùng khi gửi ảnh áp dụng cho mọi provider. Ảnh được gửi native theo định dạng provider; file text/code được đọc toàn bộ và chèn vào prompt với tên cùng delimiter rõ ràng.
-- Binary ngoài ảnh bị từ chối. PDF chưa được hỗ trợ và sẽ bị chặn trước khi gửi, thay vì bị nhận nhầm thành ảnh. Ứng dụng không đặt hard limit riêng cho số attachment hoặc kích thước; RAM, context window, payload và policy của provider vẫn là giới hạn thực tế.
+- PDF được xử lý hybrid ngoài UI thread: trang có text được trích xuất theo tên file/số trang; trang không có text được render PNG ở `144 DPI` và gửi như ảnh. Một PDF vẫn hiện thành một attachment trong UI. PDF có mật khẩu chưa được hỗ trợ; PDF hỏng hoặc trang render lỗi bị từ chối toàn bộ, không gửi payload một phần.
+- Binary ngoài ảnh/PDF bị từ chối. Ứng dụng không đặt hard limit riêng cho số attachment, số trang PDF hoặc kích thước; RAM, context window, payload và policy của provider vẫn là giới hạn thực tế.
 - Nếu dispatch/provider lỗi, draft và attachment được đưa lại composer; lỗi thật được hiển thị để có thể sửa rồi gửi lại.
 
 Cấu hình OpenAI-compatible cũ được chuyển một lần thành profile đầu tiên. Mỗi provider có danh sách model riêng; mọi model gợi ý đều có thể xóa và model tự nhập có thể lưu lại. Danh sách gợi ý không bảo đảm model đang tồn tại hoặc account hiện tại có quyền sử dụng; dùng **Test** để kiểm tra qua provider thật.
@@ -79,6 +80,8 @@ Với OpenAI-compatible profile bật **Gemini Web2API**, `Ctrl+N` gửi `POST {
 .\.venv\Scripts\python.exe .\_smoke_codex_protocol.py
 $env:QT_QPA_PLATFORM = "offscreen"
 .\.venv\Scripts\python.exe .\_smoke_clipboard.py
+.\.venv\Scripts\python.exe .\_smoke_attachment_ui.py
+.\.venv\Scripts\python.exe .\_smoke_pdf_hybrid.py
 .\.venv\Scripts\python.exe -m py_compile .\app.py
 ```
 
